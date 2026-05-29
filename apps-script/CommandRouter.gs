@@ -326,6 +326,17 @@ function handleTextMessage(event, config) {
     return;
   }
 
+  if (text === '確認' || text === '確認修改') {
+    handlePendingMealCorrectionConfirmation(event, config, userId, timestamp, date);
+    return;
+  }
+
+  if (text === '取消' || text === '取消修改') {
+    clearPendingActions(userId, 'meal_correction', config);
+    replyToLine(event.replyToken, '已取消待確認的餐點修正。', config);
+    return;
+  }
+
   if (text === '今日') {
     var summary = calculateDailySummary(userId, date, config);
     upsertDailySummary(summary, config);
@@ -378,12 +389,40 @@ function handleTextMessage(event, config) {
   var mealCorrection = parseMealCorrectionText(text);
 
   if (mealCorrection) {
-    var updated = updateLastMealNutrition(userId, mealCorrection, 'user_corrected:' + text + ' @ ' + timestamp, config);
+    var preview = previewMealNutritionCorrection(userId, mealCorrection, config);
 
-    if (!updated) {
+    if (!preview) {
       replyToLine(event.replyToken, '找不到可修正的上一筆餐點。', config);
       return;
     }
+
+    var warnings = validateMealCorrectionPreview(preview.row, preview.nutrition, mealCorrection);
+
+    if (warnings.length > 0) {
+      clearPendingActions(userId, 'meal_correction', config);
+      appendPendingAction({
+        id: createUuid(),
+        timestamp: timestamp,
+        expires_at: pendingExpiresAt(config),
+        user_id: userId,
+        action_type: 'meal_correction',
+        payload_json: stringifyJson({
+          rowNumber: preview.row._rowNumber,
+          correction: mealCorrection,
+          originalText: text
+        }),
+        status: 'pending'
+      }, config);
+      replyToLine(event.replyToken, formatCorrectionWarningReply(preview.row, preview.nutrition, warnings), config);
+      return;
+    }
+
+    var updated = applyMealNutritionCorrectionByRow(
+      preview.row._rowNumber,
+      mealCorrection,
+      'user_corrected:' + text + ' @ ' + timestamp,
+      config
+    );
 
     var correctedSummary = calculateDailySummary(userId, date, config);
     upsertDailySummary(correctedSummary, config);
@@ -482,6 +521,34 @@ function handleTextMessage(event, config) {
     error: '',
     raw_event: stringifyJson(event)
   }, config);
+}
+
+function handlePendingMealCorrectionConfirmation(event, config, userId, timestamp, date) {
+  var pending = getLatestPendingAction(userId, 'meal_correction', config);
+
+  if (!pending) {
+    replyToLine(event.replyToken, '目前沒有待確認的餐點修正。', config);
+    return;
+  }
+
+  var payload = extractJsonObject(pending.payload_json);
+  var updated = applyMealNutritionCorrectionByRow(
+    payload.rowNumber,
+    payload.correction,
+    'user_confirmed_correction:' + (payload.originalText || '') + ' @ ' + timestamp,
+    config
+  );
+
+  resolvePendingAction(pending._rowNumber, 'confirmed', config);
+
+  if (!updated) {
+    replyToLine(event.replyToken, '確認失敗：找不到原本要修正的餐點，可能已被刪除。', config);
+    return;
+  }
+
+  var correctedSummary = calculateDailySummary(userId, date, config);
+  upsertDailySummary(correctedSummary, config);
+  replyToLine(event.replyToken, formatCorrectionReply(updated, payload.correction, correctedSummary), config);
 }
 
 function getEventUserId(event) {
@@ -616,6 +683,86 @@ function parseMealCorrectionText(text) {
 
   correction.adjustRemainder = /其他.*(配合|調整)|配合.*(熱量|總熱量)|剩下.*調整/.test(text);
   return correction;
+}
+
+function validateMealCorrectionPreview(meal, nutrition, correction) {
+  var after = nutrition.after || {
+    calories: nutrition.calories,
+    protein: nutrition.protein,
+    carbs: nutrition.carbs,
+    fat: nutrition.fat
+  };
+  var warnings = [];
+  var calories = toNumber(after.calories, 0);
+  var protein = toNumber(after.protein, 0);
+  var carbs = toNumber(after.carbs, 0);
+  var fat = toNumber(after.fat, 0);
+  var macroEnergy = protein * 4 + carbs * 4 + fat * 9;
+
+  if (calories <= 0 || protein < 0 || carbs < 0 || fat < 0) {
+    warnings.push('出現 0 以下或無效數值。');
+  }
+
+  if (calories < 80) {
+    warnings.push('熱量低於 80 kcal，可能不合理。');
+  }
+
+  if (calories > 1800) {
+    warnings.push('單餐熱量高於 1800 kcal，請確認。');
+  }
+
+  if (protein > 120) {
+    warnings.push('蛋白質高於 120g，請確認。');
+  }
+
+  if (carbs > 250) {
+    warnings.push('碳水高於 250g，請確認。');
+  }
+
+  if (fat > 120) {
+    warnings.push('脂肪高於 120g，請確認。');
+  }
+
+  if (macroEnergy > 0 && Math.abs(macroEnergy - calories) > Math.max(120, calories * 0.25)) {
+    warnings.push('熱量與 P/C/F 換算值落差過大。');
+  }
+
+  if (hasSheetValue(correction.calories) &&
+    Math.abs(calories - Number(correction.calories)) > Math.max(80, Number(correction.calories) * 0.2)) {
+    warnings.push('指定熱量與營養素互相矛盾，系統推導後熱量已明顯偏離你輸入的熱量。');
+  }
+
+  return warnings;
+}
+
+function formatCorrectionWarningReply(meal, nutrition, warnings) {
+  var before = nutrition.before || meal._beforeNutrition || {};
+  var after = {
+    calories: nutrition.calories,
+    protein: nutrition.protein,
+    carbs: nutrition.carbs,
+    fat: nutrition.fat
+  };
+
+  return [
+    '這次修正可能異常，先不寫入。',
+    '',
+    '餐點：' + (meal.meal_name || '未命名餐點'),
+    '原本：' + Math.round(before.calories || 0) + ' kcal｜P ' + Math.round(before.protein || 0) + '｜C ' + Math.round(before.carbs || 0) + '｜F ' + Math.round(before.fat || 0),
+    '將改為：' + Math.round(after.calories) + ' kcal｜P ' + Math.round(after.protein) + '｜C ' + Math.round(after.carbs) + '｜F ' + Math.round(after.fat),
+    '',
+    '警告：',
+    warnings.map(function (warning) {
+      return '- ' + warning;
+    }).join('\n'),
+    '',
+    '回覆「確認」套用，或回覆「取消」放棄。'
+  ].join('\n');
+}
+
+function pendingExpiresAt(config) {
+  var expires = new Date(Date.now() + 10 * 60 * 1000);
+  return formatTaipeiDateTime(expires, config);
 }
 
 function matchFirstNumber(text, patterns) {

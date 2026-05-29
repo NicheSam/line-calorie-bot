@@ -117,6 +117,15 @@ var SHEET_SCHEMAS = {
     'calorie_gap',
     'protein_gap'
   ],
+  PendingActions: [
+    'id',
+    'timestamp',
+    'expires_at',
+    'user_id',
+    'action_type',
+    'payload_json',
+    'status'
+  ],
   WebhookDebug: [
     'timestamp',
     'stage',
@@ -210,6 +219,18 @@ function appendWebhookDebug(record, config) {
   }, config);
 }
 
+function appendPendingAction(record, config) {
+  appendRowObject('PendingActions', {
+    id: record.id,
+    timestamp: record.timestamp || nowIso(config),
+    expires_at: record.expires_at || '',
+    user_id: record.user_id || '',
+    action_type: record.action_type || '',
+    payload_json: record.payload_json || '',
+    status: record.status || 'pending'
+  }, config);
+}
+
 function readSheetRows(sheetName, config) {
   var sheet = getSheetByName(sheetName, config);
   var values = sheet.getDataRange().getValues();
@@ -251,6 +272,38 @@ function updateLastMealNutrition(userId, correction, note, config) {
   var row = findLatestActiveMealLog(userId, config);
 
   if (!row) {
+    return null;
+  }
+
+  var nutrition = deriveCorrectedNutrition(row, correction || {});
+  var sheet = getSheetByName('MealLogs', config);
+  sheet.getRange(row._rowNumber, 10).setValue(nutrition.calories);
+  sheet.getRange(row._rowNumber, 11).setValue(nutrition.protein);
+  sheet.getRange(row._rowNumber, 12).setValue(nutrition.carbs);
+  sheet.getRange(row._rowNumber, 13).setValue(nutrition.fat);
+  sheet.getRange(row._rowNumber, 16).setValue(note);
+  row.corrected_calories = nutrition.calories;
+  row.protein_g = nutrition.protein;
+  row.carbs_g = nutrition.carbs;
+  row.fat_g = nutrition.fat;
+  row.user_note = note;
+  row._beforeNutrition = nutrition.before;
+  row._afterNutrition = {
+    calories: nutrition.calories,
+    protein: nutrition.protein,
+    carbs: nutrition.carbs,
+    fat: nutrition.fat
+  };
+  row._correctionMeta = nutrition.meta;
+  return row;
+}
+
+function applyMealNutritionCorrectionByRow(rowNumber, correction, note, config) {
+  var row = readSheetRows('MealLogs', config).filter(function (record) {
+    return Number(record._rowNumber) === Number(rowNumber);
+  })[0];
+
+  if (!row || !isActiveStatus(row.status)) {
     return null;
   }
 
@@ -346,12 +399,40 @@ function deriveCorrectedNutrition(row, correction) {
     carbs: roundNonNegative(carbs),
     fat: roundNonNegative(fat),
     before: before,
+    after: {
+      calories: roundNonNegative(calories),
+      protein: roundNonNegative(protein),
+      carbs: roundNonNegative(carbs),
+      fat: roundNonNegative(fat)
+    },
     meta: meta
   };
 }
 
 function macroCalories(protein, carbs, fat) {
   return toNumber(protein, 0) * 4 + toNumber(carbs, 0) * 4 + toNumber(fat, 0) * 9;
+}
+
+function previewMealNutritionCorrection(userId, correction, config) {
+  var row = findLatestActiveMealLog(userId, config);
+
+  if (!row) {
+    return null;
+  }
+
+  var nutrition = deriveCorrectedNutrition(row, correction || {});
+  row._beforeNutrition = nutrition.before;
+  row._afterNutrition = {
+    calories: nutrition.calories,
+    protein: nutrition.protein,
+    carbs: nutrition.carbs,
+    fat: nutrition.fat
+  };
+  row._correctionMeta = nutrition.meta;
+  return {
+    row: row,
+    nutrition: nutrition
+  };
 }
 
 function cancelLastMealLog(userId, note, config) {
@@ -449,6 +530,45 @@ function getCorrectedMealLogsByDateRange(userId, startDate, endDate, config) {
   return getActiveMealLogsByDateRange(userId, startDate, endDate, config).filter(function (row) {
     return hasSheetValue(row.corrected_calories);
   });
+}
+
+function getLatestPendingAction(userId, actionType, config) {
+  var rows = readSheetRows('PendingActions', config);
+
+  for (var index = rows.length - 1; index >= 0; index -= 1) {
+    if (String(rows[index].user_id) === String(userId) &&
+      String(rows[index].action_type) === String(actionType) &&
+      String(rows[index].status) === 'pending' &&
+      !isPendingActionExpired(rows[index], config)) {
+      return rows[index];
+    }
+  }
+
+  return null;
+}
+
+function resolvePendingAction(rowNumber, status, config) {
+  var sheet = getSheetByName('PendingActions', config);
+  sheet.getRange(rowNumber, 7).setValue(status);
+  SpreadsheetApp.flush();
+}
+
+function clearPendingActions(userId, actionType, config) {
+  readSheetRows('PendingActions', config).forEach(function (row) {
+    if (String(row.user_id) === String(userId) &&
+      String(row.action_type) === String(actionType) &&
+      String(row.status) === 'pending') {
+      resolvePendingAction(row._rowNumber, 'cancelled', config);
+    }
+  });
+}
+
+function isPendingActionExpired(row, config) {
+  if (!row.expires_at) {
+    return false;
+  }
+
+  return new Date(row.expires_at).getTime() < Date.now();
 }
 
 function getBodyMetricsByDate(userId, date, config) {
