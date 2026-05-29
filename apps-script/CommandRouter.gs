@@ -375,11 +375,10 @@ function handleTextMessage(event, config) {
     return;
   }
 
-  var correctionMatch = /^改成\s*(\d+(?:\.\d+)?)\s*$/.exec(text);
+  var mealCorrection = parseMealCorrectionText(text);
 
-  if (correctionMatch) {
-    var calories = Math.round(Number(correctionMatch[1]));
-    var updated = updateLastMealCalories(userId, calories, 'user_corrected:' + text + ' @ ' + timestamp, config);
+  if (mealCorrection) {
+    var updated = updateLastMealNutrition(userId, mealCorrection, 'user_corrected:' + text + ' @ ' + timestamp, config);
 
     if (!updated) {
       replyToLine(event.replyToken, '找不到可修正的上一筆餐點。', config);
@@ -388,7 +387,7 @@ function handleTextMessage(event, config) {
 
     var correctedSummary = calculateDailySummary(userId, date, config);
     upsertDailySummary(correctedSummary, config);
-    replyToLine(event.replyToken, formatCorrectionReply(updated, calories, correctedSummary), config);
+    replyToLine(event.replyToken, formatCorrectionReply(updated, mealCorrection, correctedSummary), config);
     appendSystemEvent({
       timestamp: timestamp,
       user_id: userId,
@@ -529,7 +528,7 @@ function formatMealEstimateReply(estimate, summary) {
     '',
     formatCompactDailyProgress(summary),
     '',
-    '可回覆：改成 600、不記錄、今日'
+    '可回覆：改成 600、改成 650 P30、不記錄、今日'
   ].join('\n');
 }
 
@@ -555,7 +554,7 @@ function formatNutritionLabelReply(label, summary) {
   lines.push('');
   lines.push(formatCompactDailyProgress(summary));
   lines.push('');
-  lines.push('可回覆：改成 600、不記錄、今日');
+  lines.push('可回覆：改成 600、改成 650 P30、不記錄、今日');
   return lines.join('\n');
 }
 
@@ -573,6 +572,69 @@ function translateServingBasis(value) {
   if (value === 'per_serving') return '每份';
   if (value === 'per_100g') return '每 100g';
   return '未判定份量基準';
+}
+
+function parseMealCorrectionText(text) {
+  var correction = {};
+  var calories = matchFirstNumber(text, [
+    /改成\s*(?:約|大約|大概|差不多)?\s*(\d+(?:\.\d+)?)/i,
+    /熱量\s*(?:改成|約|大約|大概|差不多|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
+    /(\d+(?:\.\d+)?)\s*(?:kcal|卡|大卡)/i
+  ]);
+  var protein = matchFirstNumber(text, [
+    /(?:蛋白質|蛋白)\s*(?:改成|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:^|[\s,，;；])p\s*(?:約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i
+  ]);
+  var carbs = matchFirstNumber(text, [
+    /(?:碳水|碳水化合物)\s*(?:改成|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:^|[\s,，;；])c\s*(?:約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i
+  ]);
+  var fat = matchFirstNumber(text, [
+    /(?:脂肪|油脂)\s*(?:改成|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:^|[\s,，;；])f\s*(?:約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i
+  ]);
+
+  if (calories !== null) {
+    correction.calories = Math.round(calories);
+  }
+
+  if (protein !== null) {
+    correction.protein = protein;
+  }
+
+  if (carbs !== null) {
+    correction.carbs = carbs;
+  }
+
+  if (fat !== null) {
+    correction.fat = fat;
+  }
+
+  if (!hasAnyMealCorrection(correction)) {
+    return null;
+  }
+
+  correction.adjustRemainder = /其他.*(配合|調整)|配合.*(熱量|總熱量)|剩下.*調整/.test(text);
+  return correction;
+}
+
+function matchFirstNumber(text, patterns) {
+  for (var index = 0; index < patterns.length; index += 1) {
+    var match = patterns[index].exec(text);
+
+    if (match) {
+      return Number(match[1]);
+    }
+  }
+
+  return null;
+}
+
+function hasAnyMealCorrection(correction) {
+  return hasSheetValue(correction.calories) ||
+    hasSheetValue(correction.protein) ||
+    hasSheetValue(correction.carbs) ||
+    hasSheetValue(correction.fat);
 }
 
 function parseBodyMetricsText(text) {
@@ -730,18 +792,33 @@ function formatCompactDailyProgress(summary) {
   ].join('\n');
 }
 
-function formatCorrectionReply(meal, calories, summary) {
-  var original = hasSheetValue(meal.corrected_calories)
-    ? toNumber(meal.corrected_calories, 0)
-    : toNumber(meal.ai_calories, 0);
-
-  return [
+function formatCorrectionReply(meal, correction, summary) {
+  var before = meal._beforeNutrition || {
+    calories: toNumber(meal.ai_calories, 0),
+    protein: toNumber(meal.protein_g, 0),
+    carbs: toNumber(meal.carbs_g, 0),
+    fat: toNumber(meal.fat_g, 0)
+  };
+  var after = meal._afterNutrition || {
+    calories: toNumber(meal.corrected_calories, 0),
+    protein: toNumber(meal.protein_g, 0),
+    carbs: toNumber(meal.carbs_g, 0),
+    fat: toNumber(meal.fat_g, 0)
+  };
+  var lines = [
     '已修正上一筆：' + (meal.meal_name || '未命名餐點'),
-    '熱量：' + Math.round(original) + ' → ' + calories + ' kcal',
-    '',
-    formatCompactDailyProgress(summary),
-    formatCalorieGap(summary)
-  ].join('\n');
+    '熱量：' + Math.round(before.calories) + ' → ' + Math.round(after.calories) + ' kcal',
+    'P：' + Math.round(before.protein) + ' → ' + Math.round(after.protein) + 'g｜C：' + Math.round(before.carbs) + ' → ' + Math.round(after.carbs) + 'g｜F：' + Math.round(before.fat) + ' → ' + Math.round(after.fat) + 'g'
+  ];
+
+  if (meal._correctionMeta && meal._correctionMeta.length) {
+    lines.push('調整：' + meal._correctionMeta.join('；'));
+  }
+
+  lines.push('');
+  lines.push(formatCompactDailyProgress(summary));
+  lines.push(formatCalorieGap(summary));
+  return lines.join('\n');
 }
 
 function formatCancelReply(meal, summary) {

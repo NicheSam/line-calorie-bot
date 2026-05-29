@@ -242,16 +242,116 @@ function findLatestActiveMealLog(userId, config) {
 }
 
 function updateLastMealCalories(userId, calories, note, config) {
+  return updateLastMealNutrition(userId, {
+    calories: calories
+  }, note, config);
+}
+
+function updateLastMealNutrition(userId, correction, note, config) {
   var row = findLatestActiveMealLog(userId, config);
 
   if (!row) {
     return null;
   }
 
+  var nutrition = deriveCorrectedNutrition(row, correction || {});
   var sheet = getSheetByName('MealLogs', config);
-  sheet.getRange(row._rowNumber, 10).setValue(calories);
+  sheet.getRange(row._rowNumber, 10).setValue(nutrition.calories);
+  sheet.getRange(row._rowNumber, 11).setValue(nutrition.protein);
+  sheet.getRange(row._rowNumber, 12).setValue(nutrition.carbs);
+  sheet.getRange(row._rowNumber, 13).setValue(nutrition.fat);
   sheet.getRange(row._rowNumber, 16).setValue(note);
+  row.corrected_calories = nutrition.calories;
+  row.protein_g = nutrition.protein;
+  row.carbs_g = nutrition.carbs;
+  row.fat_g = nutrition.fat;
+  row.user_note = note;
+  row._beforeNutrition = nutrition.before;
+  row._afterNutrition = {
+    calories: nutrition.calories,
+    protein: nutrition.protein,
+    carbs: nutrition.carbs,
+    fat: nutrition.fat
+  };
+  row._correctionMeta = nutrition.meta;
   return row;
+}
+
+function deriveCorrectedNutrition(row, correction) {
+  var before = {
+    calories: getEffectiveMealCalories(row),
+    protein: toNumber(row.protein_g, 0),
+    carbs: toNumber(row.carbs_g, 0),
+    fat: toNumber(row.fat_g, 0)
+  };
+  var hasCalories = hasSheetValue(correction.calories);
+  var hasProtein = hasSheetValue(correction.protein);
+  var hasCarbs = hasSheetValue(correction.carbs);
+  var hasFat = hasSheetValue(correction.fat);
+  var protein = hasProtein ? Number(correction.protein) : before.protein;
+  var carbs = hasCarbs ? Number(correction.carbs) : before.carbs;
+  var fat = hasFat ? Number(correction.fat) : before.fat;
+  var calories = hasCalories ? Number(correction.calories) : null;
+  var meta = [];
+
+  if (hasCalories && !hasProtein && !hasCarbs && !hasFat) {
+    var currentMacroCalories = macroCalories(before.protein, before.carbs, before.fat);
+
+    if (currentMacroCalories > 0) {
+      var scale = calories / currentMacroCalories;
+      protein = before.protein * scale;
+      carbs = before.carbs * scale;
+      fat = before.fat * scale;
+      meta.push('熱量修正，三大營養素依原比例同步調整');
+    }
+  } else if (hasCalories) {
+    var fixedEnergy = (hasProtein ? protein * 4 : 0) +
+      (hasCarbs ? carbs * 4 : 0) +
+      (hasFat ? fat * 9 : 0);
+    var remainingEnergy = calories - fixedEnergy;
+    var originalRemainingEnergy = (hasProtein ? 0 : before.protein * 4) +
+      (hasCarbs ? 0 : before.carbs * 4) +
+      (hasFat ? 0 : before.fat * 9);
+
+    if (remainingEnergy > 0 && originalRemainingEnergy > 0) {
+      var remainingScale = remainingEnergy / originalRemainingEnergy;
+
+      if (!hasProtein) {
+        protein = before.protein * remainingScale;
+      }
+
+      if (!hasCarbs) {
+        carbs = before.carbs * remainingScale;
+      }
+
+      if (!hasFat) {
+        fat = before.fat * remainingScale;
+      }
+
+      meta.push('指定熱量與部分營養素，其餘營養素依原比例配合熱量調整');
+    } else if (remainingEnergy < 0) {
+      calories = macroCalories(protein, carbs, fat);
+      meta.push('指定營養素換算熱量已高於指定熱量，改以營養素換算熱量為準');
+    }
+  } else if (hasProtein || hasCarbs || hasFat) {
+    calories = macroCalories(protein, carbs, fat);
+    meta.push('指定營養素後，熱量依 4/4/9 公式重新計算');
+  } else {
+    calories = before.calories;
+  }
+
+  return {
+    calories: roundNonNegative(calories),
+    protein: roundNonNegative(protein),
+    carbs: roundNonNegative(carbs),
+    fat: roundNonNegative(fat),
+    before: before,
+    meta: meta
+  };
+}
+
+function macroCalories(protein, carbs, fat) {
+  return toNumber(protein, 0) * 4 + toNumber(carbs, 0) * 4 + toNumber(fat, 0) * 9;
 }
 
 function cancelLastMealLog(userId, note, config) {
