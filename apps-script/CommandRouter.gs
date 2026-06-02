@@ -148,12 +148,16 @@ function handleMealPhotoImage(event, config, context) {
     user_note: '',
     model_used: config.geminiModel,
     raw_json: geminiResult.rawText,
-    status: 'active'
+    status: 'active',
+    rule_matches: (estimate.rule_matches || []).join('；'),
+    risk_tags: (estimate.risk_tags || []).join('；'),
+    adjustment_reasons: (estimate.adjustment_reasons || []).join('；')
   }, config);
 
   var summary = calculateDailySummary(userId, date, config);
   upsertDailySummary(summary, config);
-  replyToLine(event.replyToken, formatMealEstimateReply(estimate, summary), config);
+  var mealFallbackText = formatMealEstimateReply(estimate, summary);
+  replyMealEstimateFlex(event.replyToken, estimate, summary, mealFallbackText, config);
   appendSystemEvent({
     timestamp: timestamp,
     user_id: userId,
@@ -228,7 +232,10 @@ function handleNutritionLabelImage(event, config, context) {
     user_note: formatNutritionLabelNote(label),
     model_used: config.geminiModel,
     raw_json: geminiResult.rawText,
-    status: 'active'
+    status: 'active',
+    rule_matches: '',
+    risk_tags: '',
+    adjustment_reasons: ''
   }, config);
 
   var summary = calculateDailySummary(userId, date, config);
@@ -285,6 +292,30 @@ function handleBodyMetricImage(event, config, context) {
       success: false,
       error: error.message
     }, config);
+
+    if (typeof isTransientGeminiError === 'function' && isTransientGeminiError(error)) {
+      replyToLine(event.replyToken, [
+        '體重機照片已收到，但 Gemini 目前忙碌，暫時無法讀取。',
+        '',
+        '可以稍後重傳照片，或直接輸入：',
+        '體重 75.3',
+        '',
+        '如果還有體脂、骨骼肌，也可以一起輸入：',
+        '體重 75.3 體脂 18.3 骨骼肌 32.1'
+      ].join('\n'), config);
+      appendSystemEvent({
+        timestamp: timestamp,
+        user_id: userId,
+        message_type: 'image',
+        event_type: event.type,
+        action_taken: 'parse_body_metric_transient_failure',
+        success: false,
+        error: error.stack || error.message || String(error),
+        raw_event: stringifyJson(event)
+      }, config);
+      return;
+    }
+
     throw error;
   }
 
@@ -326,21 +357,51 @@ function handleTextMessage(event, config) {
     return;
   }
 
-  if (text === '確認' || text === '確認修改') {
+  if (handleRichMenuEntryCommand(event, config, userId, text, timestamp, date)) {
+    return;
+  }
+
+  if (isConfirmPendingCommand(text)) {
     handlePendingMealCorrectionConfirmation(event, config, userId, timestamp, date);
     return;
   }
 
-  if (text === '取消' || text === '取消修改') {
+  if (isCancelPendingCommand(text)) {
     clearPendingActions(userId, 'meal_correction', config);
     replyToLine(event.replyToken, '已取消待確認的餐點修正。', config);
     return;
   }
 
-  if (text === '今日') {
+  if (isUndoCommand(text)) {
+    var undoResult = undoLastAction(userId, config);
+
+    if (!undoResult) {
+      replyToLine(event.replyToken, '目前沒有可以復原的上一動作。', config);
+      return;
+    }
+
+    var undoDate = undoResult.meal.date || date;
+    var undoSummary = calculateDailySummary(userId, undoDate, config);
+    upsertDailySummary(undoSummary, config);
+    replyToLine(event.replyToken, formatUndoReply(undoResult, undoSummary), config);
+    appendSystemEvent({
+      timestamp: timestamp,
+      user_id: userId,
+      message_type: 'text',
+      event_type: event.type,
+      action_taken: 'undo_last_action',
+      success: true,
+      error: '',
+      raw_event: stringifyJson(event)
+    }, config);
+    return;
+  }
+
+  if (isDailySummaryCommand(text)) {
     var summary = calculateDailySummary(userId, date, config);
     upsertDailySummary(summary, config);
-    replyToLine(event.replyToken, formatDailySummaryReply(summary), config);
+    var dailyFallbackText = formatDailySummaryReply(summary);
+    replyDailySummaryFlex(event.replyToken, summary, dailyFallbackText, config);
     appendSystemEvent({
       timestamp: timestamp,
       user_id: userId,
@@ -354,15 +415,14 @@ function handleTextMessage(event, config) {
     return;
   }
 
-  if (text === '本週總結' || text === '週總結') {
-    var weeklyMemory = generateWeeklyMemory(userId, date, config);
-    replyToLine(event.replyToken, '已建立本週總結\n' + weeklyMemory.file.fileName + '\n' + weeklyMemory.file.driveUrl, config);
+  if (isRecordMealCommand(text)) {
+    replyToLine(event.replyToken, formatRecordMealGuideReply(), config);
     appendSystemEvent({
       timestamp: timestamp,
       user_id: userId,
       message_type: 'text',
       event_type: event.type,
-      action_taken: 'generate_weekly_memory',
+      action_taken: 'guide_record_meal',
       success: true,
       error: '',
       raw_event: stringifyJson(event)
@@ -370,7 +430,75 @@ function handleTextMessage(event, config) {
     return;
   }
 
-  if (text === '修正學習' || text === '個人化修正學習') {
+  if (isRecordBodyCommand(text)) {
+    replyToLine(event.replyToken, formatRecordBodyGuideReply(), config);
+    appendSystemEvent({
+      timestamp: timestamp,
+      user_id: userId,
+      message_type: 'text',
+      event_type: event.type,
+      action_taken: 'guide_record_body',
+      success: true,
+      error: '',
+      raw_event: stringifyJson(event)
+    }, config);
+    return;
+  }
+
+  if (isApiUsageCommand(text)) {
+    var apiUsage = getApiUsageSummary(date, config);
+    replyToLine(event.replyToken, formatApiUsageReply(apiUsage), config);
+    appendSystemEvent({
+      timestamp: timestamp,
+      user_id: userId,
+      message_type: 'text',
+      event_type: event.type,
+      action_taken: 'api_usage_summary',
+      success: true,
+      error: '',
+      raw_event: stringifyJson(event)
+    }, config);
+    return;
+  }
+
+  if (isAiCoachCommand(text)) {
+    handleAiCoachCommand(event, config, userId, timestamp, date, 'coach_entry');
+    return;
+  }
+
+  if (isWeeklyMemoryCommand(text)) {
+    var instantWeeklySummary = generateInstantWeeklySummary(userId, date, config);
+    appendApiUsage({
+      timestamp: timestamp,
+      model: config.geminiModel,
+      task_type: 'instant_weekly_summary',
+      input_tokens: instantWeeklySummary.usage.inputTokens,
+      output_tokens: instantWeeklySummary.usage.outputTokens,
+      estimated_cost_usd: instantWeeklySummary.usage.estimatedCostUsd,
+      line_message_id: event.message.id,
+      success: instantWeeklySummary.usage.success,
+      error: instantWeeklySummary.usage.error || ''
+    }, config);
+    replyInstantWeeklySummaryFlex(
+      event.replyToken,
+      instantWeeklySummary,
+      formatInstantWeeklySummaryFallbackText(instantWeeklySummary),
+      config
+    );
+    appendSystemEvent({
+      timestamp: timestamp,
+      user_id: userId,
+      message_type: 'text',
+      event_type: event.type,
+      action_taken: 'instant_weekly_summary',
+      success: true,
+      error: '',
+      raw_event: stringifyJson(event)
+    }, config);
+    return;
+  }
+
+  if (isCorrectionLearningCommand(text)) {
     var learningMemory = generateCorrectionLearningMemory(userId, date, config);
     replyToLine(event.replyToken, '已建立修正學習報告\n' + learningMemory.file.fileName + '\n' + learningMemory.file.driveUrl, config);
     appendSystemEvent({
@@ -387,6 +515,10 @@ function handleTextMessage(event, config) {
   }
 
   var mealCorrection = parseMealCorrectionText(text);
+
+  if (!mealCorrection && shouldTryAiMealCorrectionParser(text)) {
+    mealCorrection = parseMealCorrectionTextWithAi(text, event, config, timestamp);
+  }
 
   if (mealCorrection) {
     var preview = previewMealNutritionCorrection(userId, mealCorrection, config);
@@ -440,7 +572,7 @@ function handleTextMessage(event, config) {
     return;
   }
 
-  if (text === '不記錄' || text === '不紀錄' || text === '取消上一筆' || text === '刪除上一筆') {
+  if (isCancelLastMealCommand(text)) {
     var cancelled = cancelLastMealLog(userId, 'cancelled_by_user @ ' + timestamp, config);
 
     if (!cancelled) {
@@ -464,7 +596,7 @@ function handleTextMessage(event, config) {
     return;
   }
 
-  if (text === '今日總結' || text === '產生今日記憶') {
+  if (isDailyMemoryCommand(text)) {
     var memory = generateDailyMemory(userId, date, config);
     replyToLine(event.replyToken, '已建立今日總結\n' + memory.file.fileName + '\n' + memory.file.driveUrl, config);
     appendSystemEvent({
@@ -521,6 +653,113 @@ function handleTextMessage(event, config) {
     error: '',
     raw_event: stringifyJson(event)
   }, config);
+}
+
+function handleRichMenuEntryCommand(event, config, userId, text, timestamp, date) {
+  if (!isExactRichMenuCommand(text)) {
+    return false;
+  }
+
+  if (isRecordBodyCommand(text)) {
+    replyToLine(event.replyToken, formatRecordBodyGuideReply(), config);
+    appendTextCommandEvent(timestamp, userId, event, 'rich_menu_record_body', true, '', config);
+    return true;
+  }
+
+  if (isRecordMealCommand(text)) {
+    replyToLine(event.replyToken, formatRecordMealGuideReply(), config);
+    appendTextCommandEvent(timestamp, userId, event, 'rich_menu_record_meal', true, '', config);
+    return true;
+  }
+
+  if (isApiUsageCommand(text)) {
+    var apiUsage = getApiUsageSummary(date, config);
+    replyToLine(event.replyToken, formatApiUsageReply(apiUsage), config);
+    appendTextCommandEvent(timestamp, userId, event, 'rich_menu_api_usage', true, '', config);
+    return true;
+  }
+
+  if (isAiCoachCommand(text)) {
+    handleAiCoachCommand(event, config, userId, timestamp, date, 'rich_menu_ai_coach');
+    return true;
+  }
+
+  return false;
+}
+
+function isExactRichMenuCommand(text) {
+  return matchesCompactCommand(text, [
+    '記體重',
+    '記飲食',
+    'API額度',
+    'AI教練'
+  ]);
+}
+
+function appendTextCommandEvent(timestamp, userId, event, actionTaken, success, error, config) {
+  appendSystemEvent({
+    timestamp: timestamp,
+    user_id: userId,
+    message_type: 'text',
+    event_type: event.type,
+    action_taken: actionTaken,
+    success: success,
+    error: error || '',
+    raw_event: stringifyJson(event)
+  }, config);
+}
+
+function handleAiCoachCommand(event, config, userId, timestamp, date, actionTaken) {
+  var summary = calculateDailySummary(userId, date, config);
+  var logs = getActiveMealLogsByDate(userId, date, config);
+  var profile = getUserProfile(userId, config) || {};
+  var replyText = '';
+  var usedFallback = false;
+
+  upsertDailySummary(summary, config);
+
+  if (summary.mealCount === 0) {
+    replyText = formatCoachEntryReply(summary);
+    usedFallback = true;
+  } else {
+    try {
+      var coachResult = callGeminiForCoachAdvice({
+        date: date,
+        summary: summary,
+        logs: logs,
+        profile: profile
+      }, config);
+      appendApiUsage({
+        timestamp: timestamp,
+        model: config.geminiModel,
+        task_type: 'coach_advice',
+        input_tokens: coachResult.inputTokens,
+        output_tokens: coachResult.outputTokens,
+        estimated_cost_usd: coachResult.estimatedCostUsd,
+        line_message_id: event.message.id,
+        success: true,
+        error: ''
+      }, config);
+      replyText = formatGeminiCoachReply(summary, coachResult.text);
+    } catch (error) {
+      appendApiUsage({
+        timestamp: timestamp,
+        model: config.geminiModel,
+        task_type: 'coach_advice',
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0,
+        line_message_id: event.message.id,
+        success: false,
+        error: error.message || String(error)
+      }, config);
+      replyText = formatCoachFallbackReply(summary);
+      usedFallback = true;
+    }
+  }
+
+  replyToLine(event.replyToken, replyText, config);
+  appendTextCommandEvent(timestamp, userId, event, actionTaken, true, usedFallback ? 'coach_fallback_used' : '', config);
 }
 
 function handlePendingMealCorrectionConfirmation(event, config, userId, timestamp, date) {
@@ -588,6 +827,15 @@ function buildBodyMetricRecord(input) {
 }
 
 function formatMealEstimateReply(estimate, summary) {
+  var reminder = buildPostMealReminder({
+    calories: estimate.total.calories_kcal,
+    protein: estimate.total.protein_g,
+    carbs: estimate.total.carbs_g,
+    fat: estimate.total.fat_g,
+    confidence: estimate.confidence,
+    sourceType: 'meal_photo'
+  }, summary);
+
   return [
     '已記錄：' + estimate.meal_name,
     '約 ' + estimate.total.calories_kcal + ' kcal｜P ' + estimate.total.protein_g + 'g｜C ' + estimate.total.carbs_g + 'g｜F ' + estimate.total.fat_g + 'g',
@@ -595,7 +843,9 @@ function formatMealEstimateReply(estimate, summary) {
     '',
     formatCompactDailyProgress(summary),
     '',
-    '可回覆：改成 600、改成 650 P30、不記錄、今日'
+    reminder,
+    '',
+    '可回覆：改700、改700 P30、不記錄、今日'
   ].join('\n');
 }
 
@@ -621,7 +871,17 @@ function formatNutritionLabelReply(label, summary) {
   lines.push('');
   lines.push(formatCompactDailyProgress(summary));
   lines.push('');
-  lines.push('可回覆：改成 600、改成 650 P30、不記錄、今日');
+  lines.push(buildPostMealReminder({
+    calories: label.total.calories_kcal,
+    protein: label.total.protein_g,
+    carbs: label.total.carbs_g,
+    fat: label.total.fat_g,
+    confidence: label.confidence,
+    servingBasis: label.serving_basis,
+    sourceType: 'nutrition_label'
+  }, summary));
+  lines.push('');
+  lines.push('可回覆：改700、改700 P30、不記錄、今日');
   return lines.join('\n');
 }
 
@@ -641,24 +901,322 @@ function translateServingBasis(value) {
   return '未判定份量基準';
 }
 
+function compactCommandText(text) {
+  return String(text || '')
+    .trim()
+    .replace(/[\s\u00a0\u3000\u200b-\u200d\ufeff]/g, '')
+    .toLowerCase();
+}
+
+function matchesCompactCommand(text, commands) {
+  var compact = compactCommandText(text);
+
+  for (var index = 0; index < commands.length; index += 1) {
+    if (compact === compactCommandText(commands[index])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isConfirmPendingCommand(text) {
+  return matchesCompactCommand(text, [
+    '確認',
+    '確認修改',
+    '確定',
+    '確定修改',
+    '套用',
+    '套用修改',
+    '可以',
+    '沒問題',
+    '對',
+    '是',
+    '是的',
+    'yes',
+    'ok'
+  ]);
+}
+
+function isCancelPendingCommand(text) {
+  return matchesCompactCommand(text, [
+    '取消',
+    '取消修改',
+    '取消確認',
+    '不要改',
+    '先不要',
+    '算了',
+    '不用了',
+    'no'
+  ]);
+}
+
+function isUndoCommand(text) {
+  return matchesCompactCommand(text, [
+    '復原',
+    '還原',
+    '復原上一步',
+    '還原上一步',
+    '復原上一個動作',
+    '還原上一個動作',
+    '復原上一筆操作',
+    '還原上一筆操作',
+    '上一步',
+    '上一動',
+    '回上一步',
+    'undo',
+    'ctrlz',
+    'ctrl+z'
+  ]);
+}
+
+function isDailySummaryCommand(text) {
+  return matchesCompactCommand(text, [
+    '今日',
+    '今天',
+    '今日累計',
+    '今天累計',
+    '查今日',
+    '查今天',
+    '今日紀錄',
+    '今天紀錄',
+    '今日統計',
+    '今天統計',
+    '今日狀態',
+    '今天狀態',
+    '今日進度',
+    '今天進度',
+    '今日吃多少',
+    '今天吃多少',
+    '目前累計',
+    'today'
+  ]);
+}
+
+function isRecordMealCommand(text) {
+  return matchesCompactCommand(text, [
+    '記飲食',
+    '記餐',
+    '記錄飲食',
+    '紀錄飲食',
+    '記錄餐點',
+    '紀錄餐點',
+    '我要記飲食',
+    '我要記餐',
+    '傳餐點',
+    '拍餐點'
+  ]);
+}
+
+function isRecordBodyCommand(text) {
+  return matchesCompactCommand(text, [
+    '記體重',
+    '記錄體重',
+    '紀錄體重',
+    '記身體',
+    '記錄身體',
+    '紀錄身體',
+    '身體數據',
+    '體重記錄',
+    '體重紀錄'
+  ]);
+}
+
+function isApiUsageCommand(text) {
+  return matchesCompactCommand(text, [
+    'API額度',
+    'API用量',
+    'API使用量',
+    'api額度',
+    'api用量',
+    'api使用量',
+    '費用',
+    '成本',
+    '今日成本'
+  ]);
+}
+
+function isAiCoachCommand(text) {
+  return matchesCompactCommand(text, [
+    'AI教練',
+    'ai教練',
+    '請問AI教練',
+    '問AI教練',
+    '教練',
+    '飲食教練',
+    '今天怎麼吃',
+    '晚餐怎麼吃'
+  ]);
+}
+
+function isWeeklyMemoryCommand(text) {
+  return matchesCompactCommand(text, [
+    '本週總結',
+    '本周總結',
+    '週總結',
+    '周總結',
+    '這週總結',
+    '這周總結',
+    '本週回顧',
+    '本周回顧',
+    '週回顧',
+    '周回顧',
+    '週報',
+    '周報',
+    '產生本週記憶',
+    '產生本周記憶',
+    '建立本週記憶',
+    '建立本周記憶'
+  ]);
+}
+
+function isCorrectionLearningCommand(text) {
+  return matchesCompactCommand(text, [
+    '修正學習',
+    '個人化修正學習',
+    '整理修正',
+    '整理修正紀錄',
+    '修正紀錄',
+    '修正分析',
+    '建立修正學習',
+    '產生修正學習',
+    'foodrules建議',
+    'foodrule建議',
+    '食物規則建議',
+    '飲食規則建議'
+  ]);
+}
+
+function isDailyMemoryCommand(text) {
+  return matchesCompactCommand(text, [
+    '今日總結',
+    '今天總結',
+    '每日總結',
+    '日總結',
+    '今日回顧',
+    '今天回顧',
+    '產生今日記憶',
+    '產生今天記憶',
+    '建立今日記憶',
+    '建立今天記憶',
+    '今日md',
+    '今天md',
+    '今日markdown',
+    '今天markdown'
+  ]);
+}
+
+function isCancelLastMealCommand(text) {
+  if (matchesCompactCommand(text, [
+    '不記錄',
+    '不紀錄',
+    '取消上一筆',
+    '刪除上一筆',
+    '刪上一筆',
+    '刪掉上一筆',
+    '移除上一筆',
+    '上一筆不記錄',
+    '上一筆不紀錄',
+    '上一筆不算',
+    '這筆不記錄',
+    '這筆不紀錄',
+    '這筆不算',
+    '這筆不要記',
+    '剛剛那筆不記錄',
+    '剛剛那筆不紀錄',
+    '剛剛那筆不算',
+    '剛剛那筆不要',
+    '剛才那筆不要',
+    '最後一筆不要',
+    '最後一筆不算',
+    '取消這筆',
+    '刪除這筆',
+    '刪掉這筆'
+  ])) {
+    return true;
+  }
+
+  var compact = compactCommandText(text);
+  var hasTarget = /(上一筆|這筆|剛剛|剛才|上一餐|這餐|最後一筆)/.test(compact);
+  var hasCancelVerb = /(不記錄|不紀錄|不要記|別記|不算|取消|刪除|刪掉|移除)/.test(compact);
+  return hasTarget && hasCancelVerb;
+}
+
+function shouldTryAiMealCorrectionParser(text) {
+  var normalizedText = normalizeMealCorrectionCommandText(text);
+
+  if (!/\d/.test(normalizedText)) {
+    return false;
+  }
+
+  if (normalizedText.length > 80) {
+    return false;
+  }
+
+  return /(這餐|這筆|上一筆|剛剛|剛才|應該|大概|大約|差不多|左右|抓|算|估|記|當作|改|修|調|熱量|卡|大卡|kcal|蛋白|蛋白質|碳水|脂肪|油脂|\bP\b|\bC\b|\bF\b)/i.test(normalizedText);
+}
+
+function parseMealCorrectionTextWithAi(text, event, config, timestamp) {
+  try {
+    var result = callGeminiForMealCorrectionCommand(text, config);
+    appendApiUsage({
+      timestamp: timestamp,
+      model: config.geminiModel,
+      task_type: 'parse_correction_command',
+      input_tokens: result.inputTokens,
+      output_tokens: result.outputTokens,
+      estimated_cost_usd: result.estimatedCostUsd,
+      line_message_id: event.message.id,
+      success: Boolean(result.correction),
+      error: result.correction ? '' : 'intent_not_meal_correction'
+    }, config);
+    return result.correction;
+  } catch (error) {
+    appendApiUsage({
+      timestamp: timestamp,
+      model: config.geminiModel,
+      task_type: 'parse_correction_command',
+      input_tokens: 0,
+      output_tokens: 0,
+      estimated_cost_usd: 0,
+      line_message_id: event.message.id,
+      success: false,
+      error: error.message || String(error)
+    }, config);
+    return null;
+  }
+}
+
 function parseMealCorrectionText(text) {
+  var normalizedText = normalizeMealCorrectionCommandText(text);
   var correction = {};
-  var calories = matchFirstNumber(text, [
-    /改成\s*(?:約|大約|大概|差不多)?\s*(\d+(?:\.\d+)?)/i,
-    /熱量\s*(?:改成|約|大約|大概|差不多|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
+  var lockMacros = parseLockedMacroFields(normalizedText);
+  var calories = matchFirstNumber(normalizedText, [
+    /(?:^|[\s,，、;；|｜/])(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調)\s*(?:熱量|總熱量|calories?)?\s*(?:約|大約|大概|差不多)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:熱量|總熱量|calories?)\s*(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調|約|大約|大概|差不多|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:抓|算|估|記|當作|大概|差不多|應該|應該是|可能是)\s*(?:熱量|總熱量)?\s*(?:約|大約|大概|差不多)?\s*(\d+(?:\.\d+)?)/i,
     /(\d+(?:\.\d+)?)\s*(?:kcal|卡|大卡)/i
   ]);
-  var protein = matchFirstNumber(text, [
-    /(?:蛋白質|蛋白)\s*(?:改成|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
-    /(?:^|[\s,，;；])p\s*(?:約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i
+  var protein = matchFirstNumber(normalizedText, [
+    /(?:^|[\s,，、;；|｜/])(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調)\s*(?:蛋白質|蛋白|protein|prot|p)\s*(?:約|大約|大概|差不多)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:蛋白質|蛋白|protein|prot)\s*(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:蛋白質|蛋白|protein|prot)\s*(?:應該|應該是|可能|可能是|大概|大約|差不多|抓|算|估|記|當作|只有|大概只有|應該只有)\s*(\d+(?:\.\d+)?)/i,
+    /(?:^|[\s,，、;；|｜/])p\s*(?:應該|應該是|可能|可能是|大概|大約|差不多|抓|算|估|記|當作|只有|大概只有|應該只有)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:^|[\s,，、;；|｜/])p\s*(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i
   ]);
-  var carbs = matchFirstNumber(text, [
-    /(?:碳水|碳水化合物)\s*(?:改成|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
-    /(?:^|[\s,，;；])c\s*(?:約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i
+  var carbs = matchFirstNumber(normalizedText, [
+    /(?:^|[\s,，、;；|｜/])(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調)\s*(?:碳水|碳水化合物|carbs?|carbohydrates?|c)\s*(?:約|大約|大概|差不多)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:碳水|碳水化合物|carbs?|carbohydrates?)\s*(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:碳水|碳水化合物|carbs?|carbohydrates?)\s*(?:應該|應該是|可能|可能是|大概|大約|差不多|抓|算|估|記|當作|只有|大概只有|應該只有)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:^|[\s,，、;；|｜/])c\s*(?:應該|應該是|可能|可能是|大概|大約|差不多|抓|算|估|記|當作|只有|大概只有|應該只有)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:^|[\s,，、;；|｜/])c\s*(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i
   ]);
-  var fat = matchFirstNumber(text, [
-    /(?:脂肪|油脂)\s*(?:改成|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
-    /(?:^|[\s,，;；])f\s*(?:約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i
+  var fat = matchFirstNumber(normalizedText, [
+    /(?:^|[\s,，、;；|｜/])(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調)\s*(?:脂肪|油脂|fat|f)\s*(?:約|大約|大概|差不多)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:脂肪|油脂|fat)\s*(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:脂肪|油脂|fat)\s*(?:應該|應該是|可能|可能是|大概|大約|差不多|抓|算|估|記|當作|只有|大概只有|應該只有)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:^|[\s,，、;；|｜/])f\s*(?:應該|應該是|可能|可能是|大概|大約|差不多|抓|算|估|記|當作|只有|大概只有|應該只有)?\s*(\d+(?:\.\d+)?)/i,
+    /(?:^|[\s,，、;；|｜/])f\s*(?:改成|改為|改到|修正成|更正成|修成|調成|改|修|調|約|大約|大概|有|=|:|：)?\s*(\d+(?:\.\d+)?)/i
   ]);
 
   if (calories !== null) {
@@ -677,12 +1235,48 @@ function parseMealCorrectionText(text) {
     correction.fat = fat;
   }
 
+  if (lockMacros.protein && correction.protein === undefined) {
+    correction.lockProtein = true;
+  }
+
+  if (lockMacros.carbs && correction.carbs === undefined) {
+    correction.lockCarbs = true;
+  }
+
+  if (lockMacros.fat && correction.fat === undefined) {
+    correction.lockFat = true;
+  }
+
   if (!hasAnyMealCorrection(correction)) {
     return null;
   }
 
-  correction.adjustRemainder = /其他.*(配合|調整)|配合.*(熱量|總熱量)|剩下.*調整/.test(text);
+  correction.adjustRemainder = /其他.*(配合|調整)|配合.*(熱量|總熱量)|剩下.*調整|其他.*照.*熱量|剩下.*照.*熱量/.test(normalizedText);
   return correction;
+}
+
+function normalizeMealCorrectionCommandText(text) {
+  var normalized = String(text || '');
+
+  try {
+    normalized = normalized.normalize('NFKC');
+  } catch (error) {
+    // Older Apps Script runtimes may not support normalize.
+  }
+
+  return normalized
+    .replace(/[，、；;]/g, ' ')
+    .replace(/[｜|／/]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseLockedMacroFields(text) {
+  return {
+    protein: /(?:蛋白質|蛋白|protein|prot|p)\s*(?:不要動|不用動|不動|維持|照舊|保持|不要調|不用調)/i.test(text),
+    carbs: /(?:碳水|碳水化合物|carbs?|carbohydrates?|c)\s*(?:不要動|不用動|不動|維持|照舊|保持|不要調|不用調)/i.test(text),
+    fat: /(?:脂肪|油脂|fat|f)\s*(?:不要動|不用動|不動|維持|照舊|保持|不要調|不用調)/i.test(text)
+  };
 }
 
 function validateMealCorrectionPreview(meal, nutrition, correction) {
@@ -932,11 +1526,220 @@ function formatDailySummaryReply(summary) {
   ].join('\n');
 }
 
+function formatInstantWeeklySummaryFallbackText(weeklySummary) {
+  var trend = weeklySummary.trendSnapshot || {};
+  var weekRange = weeklySummary.weekRange || {};
+  var advice = String(weeklySummary.adviceText || '')
+    .split(/\r?\n/)
+    .map(function (line) {
+      return line.replace(/^\s*(?:\d+[\.\、]|[-・•])\s*/, '').trim();
+    })
+    .filter(function (line) {
+      return line;
+    })
+    .slice(0, 3);
+
+  return [
+    '本週即時總結',
+    (weekRange.startDate || '') + ' - ' + (weekRange.endDate || ''),
+    '',
+    '紀錄：' + (trend.meal_count || 0) + ' 餐 / ' + (trend.logged_days || 0) + ' 天',
+    '平均熱量：約 ' + (trend.avg_calories_per_logged_day || 0) + ' kcal / 日',
+    '平均蛋白質：約 ' + (trend.avg_protein_per_logged_day || 0) + ' g / 日',
+    '資料品質：修正 ' + (weeklySummary.correctedCount || 0) + '，低信心 ' + (weeklySummary.lowConfidenceCount || 0),
+    '',
+    '下週重點',
+    advice.length ? advice.map(function (line, index) {
+      return (index + 1) + '. ' + line;
+    }).join('\n') : '1. 資料不足，先穩定記錄餐點。'
+  ].join('\n');
+}
+
 function formatCompactDailyProgress(summary) {
   return [
     '今日：' + Math.round(summary.totalCalories) + ' / ' + summary.targetCalories + ' kcal',
     '蛋白質：' + Math.round(summary.totalProtein) + ' / ' + summary.proteinTarget + ' g'
   ].join('\n');
+}
+
+function buildPostMealReminder(record, summary) {
+  var calories = Math.round(toNumber(record.calories, 0));
+  var protein = Math.round(toNumber(record.protein, 0));
+  var fat = Math.round(toNumber(record.fat, 0));
+  var confidence = String(record.confidence || '').toLowerCase();
+  var calorieGap = Math.round(summary.targetCalories - summary.totalCalories);
+  var proteinGap = Math.round(summary.proteinTarget - summary.totalProtein);
+
+  if (confidence === 'low') {
+    return '提醒：這餐估算信心較低，建議用「改700 P30」修正熱量或蛋白質。';
+  }
+
+  if (record.sourceType === 'nutrition_label' && record.servingBasis === 'per_serving') {
+    return '提醒：這筆是依營養標示每份記錄；如果你吃完整包，記得確認份數是否需要修正。';
+  }
+
+  if (summary.totalCalories > summary.targetCalories) {
+    if (proteinGap > 20) {
+      return '提醒：今天熱量已超過目標，但蛋白質還不足；後續優先選低脂蛋白，少油少醬。';
+    }
+    return '提醒：今天熱量已超過目標，後續以清淡、低油、低糖為主。';
+  }
+
+  if (calorieGap <= 250) {
+    return '提醒：今天熱量已接近上限，下一餐建議控制油脂與份量。';
+  }
+
+  if (proteinGap > 35 && summary.mealCount >= 2) {
+    return '提醒：目前蛋白質缺口偏大，下一餐優先補雞胸、蛋、魚、豆腐或瘦肉。';
+  }
+
+  if (calories >= 250 && protein < 15) {
+    return '提醒：這餐蛋白質偏低，下一餐可以補一份蛋、豆腐、魚或瘦肉。';
+  }
+
+  if (fat >= 30 || (calories > 0 && fat * 9 >= calories * 0.45)) {
+    return '提醒：這餐脂肪比例偏高，下一餐可以選清蒸、烤、滷、少醬的蛋白質。';
+  }
+
+  if (proteinGap > 15) {
+    return '提醒：今天蛋白質還差一些，後續餐點記得保留蛋白質優先。';
+  }
+
+  return '提醒：目前進度可以，後續維持蛋白質優先並控制油脂即可。';
+}
+
+function formatRecordMealGuideReply() {
+  return [
+    '請直接傳餐點照片。',
+    '',
+    '我會估算熱量、蛋白質、碳水與脂肪，並寫入今日紀錄。',
+    '',
+    '如果是超商或包裝食品，也可以拍營養標示表，我會優先讀取標示上的數字。'
+  ].join('\n');
+}
+
+function formatRecordBodyGuideReply() {
+  return [
+    '請傳體重機 / InBody 照片，或直接輸入身體數據。',
+    '',
+    '範例：',
+    '體重 75.3',
+    '體重 75.3 體脂 18.3 骨骼肌 32.1'
+  ].join('\n');
+}
+
+function formatApiUsageReply(usage) {
+  return [
+    'API 使用量',
+    '',
+    '今日：' + usage.todayCalls + ' 次，成功 ' + usage.todaySuccessfulCalls + ' 次',
+    '今日估計：$' + usage.todayEstimatedCostUsd.toFixed(6) + ' USD',
+    '',
+    '累計：' + usage.totalCalls + ' 次，成功 ' + usage.totalSuccessfulCalls + ' 次',
+    '累計估計：$' + usage.totalEstimatedCostUsd.toFixed(6) + ' USD',
+    '',
+    '此成本為程式內估算，實際費用仍以 Google 後台為準。'
+  ].join('\n');
+}
+
+function formatCoachEntryReply(summary) {
+  var suggestions = buildCoachSuggestions(summary);
+  var lines = [
+    'AI 教練',
+    '',
+    '目前今日狀態：',
+    '熱量：' + Math.round(summary.totalCalories) + ' / ' + summary.targetCalories + ' kcal',
+    '蛋白質：' + Math.round(summary.totalProtein) + ' / ' + summary.proteinTarget + ' g',
+    '碳水：' + Math.round(summary.totalCarbs) + ' g',
+    '脂肪：' + Math.round(summary.totalFat) + ' g',
+    '',
+    '建議：'
+  ];
+
+  suggestions.forEach(function (suggestion) {
+    lines.push(suggestion);
+  });
+
+  return lines.join('\n');
+}
+
+function formatGeminiCoachReply(summary, coachText) {
+  return [
+    'AI 教練',
+    '',
+    '今日狀態：' + Math.round(summary.totalCalories) + ' / ' + summary.targetCalories + ' kcal，P ' + Math.round(summary.totalProtein) + ' / ' + summary.proteinTarget + ' g',
+    '',
+    sanitizeCoachText(coachText)
+  ].join('\n');
+}
+
+function formatCoachFallbackReply(summary) {
+  return [
+    'AI 教練',
+    '',
+    'Gemini 暫時無法產生建議，先用目前規則判斷：',
+    '',
+    formatCoachEntryReply(summary)
+  ].join('\n');
+}
+
+function sanitizeCoachText(text) {
+  var cleaned = String(text || '')
+    .replace(/^#+\s*/gm, '')
+    .replace(/\*\*/g, '')
+    .trim();
+
+  if (!cleaned) {
+    return '目前資料不足，先維持蛋白質優先，並控制油脂與份量。';
+  }
+
+  var lines = cleaned.split(/\r?\n/).map(function (line) {
+    return line.trim();
+  }).filter(function (line) {
+    return line;
+  });
+
+  return lines.slice(0, 8).join('\n');
+}
+
+function buildCoachSuggestions(summary) {
+  var calorieGap = Math.round(summary.targetCalories - summary.totalCalories);
+  var proteinGap = Math.round(summary.proteinTarget - summary.totalProtein);
+  var suggestions = [];
+
+  if (summary.mealCount === 0) {
+    suggestions.push('今天還沒有餐點紀錄，先傳一張餐點照片或營養標示，我再依照當天狀態給建議。');
+    return suggestions;
+  }
+
+  if (calorieGap <= 0 && proteinGap > 20) {
+    suggestions.push('今天熱量已經接近或超過目標，但蛋白質還差比較多，下一餐建議以低脂蛋白為主，例如雞胸、魚、蛋白、豆腐。');
+    return suggestions;
+  }
+
+  if (calorieGap <= 0) {
+    suggestions.push('今天熱量已經接近或超過目標，後續盡量選低油、低糖、份量小的食物。');
+    return suggestions;
+  }
+
+  if (proteinGap > 35) {
+    suggestions.push('今天蛋白質缺口偏大，下一餐優先補蛋白質，再補適量主食。');
+    suggestions.push('可選：雞胸、魚、蛋、豆腐、瘦肉，避免用高油炸物補蛋白質。');
+    return suggestions;
+  }
+
+  if (proteinGap > 15) {
+    suggestions.push('今天蛋白質還差一些，下一餐可以加一份蛋、豆腐、魚或瘦肉。');
+    return suggestions;
+  }
+
+  if (calorieGap > 600) {
+    suggestions.push('今天熱量空間還夠，可以正常吃一餐，但建議保留蛋白質優先。');
+    return suggestions;
+  }
+
+  suggestions.push('目前進度大致可以，下一餐控制油脂與份量，蛋白質維持穩定即可。');
+  return suggestions;
 }
 
 function formatCorrectionReply(meal, correction, summary) {
@@ -985,6 +1788,27 @@ function formatCancelReply(meal, summary) {
   return lines.join('\n');
 }
 
+function formatUndoReply(result, summary) {
+  var meal = result.meal || {};
+  var actionText = result.actionType === 'delete_meal' ? '刪除上一筆' : '修正上一筆';
+  var lines = [
+    '已復原：' + actionText,
+    '餐點：' + (meal.meal_name || '未命名餐點'),
+    '熱量：' + Math.round(getEffectiveMealCalories(meal)) + ' kcal',
+    '',
+    '今日：' + Math.round(summary.totalCalories) + ' / ' + summary.targetCalories + ' kcal',
+    '蛋白質：' + Math.round(summary.totalProtein) + ' / ' + summary.proteinTarget + ' g',
+    formatCalorieGap(summary)
+  ];
+
+  if (meal._driveRestoreError) {
+    lines.push('');
+    lines.push('注意：Sheet 已復原，但 Drive 圖片復原失敗。');
+  }
+
+  return lines.join('\n');
+}
+
 function formatCalorieGap(summary) {
   var gap = Math.round(summary.targetCalories - summary.totalCalories);
   return gap >= 0 ? '剩餘：約 ' + gap + ' kcal' : '超出：約 ' + Math.abs(gap) + ' kcal';
@@ -997,18 +1821,16 @@ function formatProteinGap(summary) {
 
 function formatHelpReply() {
   return [
-    '我可以幫你記錄飲食：',
+    '我還沒理解這句。',
     '',
-    '傳餐點照片：估算並記錄',
-    '傳營養標示：直接讀表格並記錄',
-    '傳體重機 / InBody 照片：記錄身體數據',
-    '體重 72.5 體脂 18.3 骨骼肌 32.1：文字記錄身體數據',
-    '今日：查看今天累計',
-    '本週總結：建立週趨勢 Markdown',
-    '修正學習：整理個人化 FoodRules 建議',
-    '改成 850：修正上一筆熱量',
-    '不記錄：刪除上一筆',
-    '今日總結：建立今日 Markdown'
+    '你可以：',
+    '傳餐點照片',
+    '傳營養標示照片',
+    '傳體重機 / InBody 照片',
+    '輸入：今日、本週總結、API額度、AI教練',
+    '修正：改850、改成 850 P30 C70',
+    '刪除：不記錄、這筆不算',
+    '復原：復原、undo'
   ].join('\n');
 }
 

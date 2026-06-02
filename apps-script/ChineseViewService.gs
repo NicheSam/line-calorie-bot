@@ -24,6 +24,9 @@ function setupFieldDictionaryView(config) {
     ['MealLogs', 'confidence', '信心', 'AI 判斷信心 high / medium / low'],
     ['MealLogs', 'uncertainty', '不確定因素', '份量、油量、標示基準等不確定處'],
     ['MealLogs', 'status', '狀態', 'active 會計入統計，cancelled 不計入'],
+    ['MealLogs', 'rule_matches', '命中規則', 'FoodRules 命中的食物規則與估計單位'],
+    ['MealLogs', 'risk_tags', '風險標籤', 'fried / sauce / starch 等高風險估算標籤'],
+    ['MealLogs', 'adjustment_reasons', '調整原因', 'FoodRules 或後處理調整原因'],
     ['BodyMetrics', 'weight_kg', '體重', '公斤'],
     ['BodyMetrics', 'body_fat_percent', '體脂率', '百分比'],
     ['BodyMetrics', 'muscle_mass_kg', '骨骼肌 / 肌肉量', '公斤，依來源報告欄位而定'],
@@ -55,6 +58,9 @@ function setupMealLogsChineseView(config) {
     '脂肪(g)',
     '信心',
     '不確定因素',
+    '命中規則',
+    '風險標籤',
+    '調整原因',
     '狀態',
     '照片連結'
   ];
@@ -72,6 +78,9 @@ function setupMealLogsChineseView(config) {
       'MealLogs!M2:M,' +
       'MealLogs!N2:N,' +
       'MealLogs!O2:O,' +
+      'MealLogs!T2:T,' +
+      'MealLogs!U2:U,' +
+      'MealLogs!V2:V,' +
       'MealLogs!S2:S,' +
       'MealLogs!G2:G' +
     '}))'

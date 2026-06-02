@@ -90,3 +90,7 @@ function setupSheets() {
   appendDefaultFoodRulesIfEmpty(config);
   return 'Sheets initialized';
 }
+
+function setupLineRichMenu() {
+  return setupRichMenu();
+}

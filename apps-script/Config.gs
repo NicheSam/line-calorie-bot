@@ -7,7 +7,8 @@ var CONFIG_PROPERTY_KEYS = {
   TIMEZONE: 'TIMEZONE',
   GEMINI_MODEL: 'GEMINI_MODEL',
   DEFAULT_TARGET_CALORIES: 'DEFAULT_TARGET_CALORIES',
-  DEFAULT_PROTEIN_TARGET_G: 'DEFAULT_PROTEIN_TARGET_G'
+  DEFAULT_PROTEIN_TARGET_G: 'DEFAULT_PROTEIN_TARGET_G',
+  RICH_MENU_IMAGE_FILE_ID: 'RICH_MENU_IMAGE_FILE_ID'
 };
 
 function getConfig() {
@@ -20,7 +21,8 @@ function getConfig() {
     timezone: getOptionalProperty(CONFIG_PROPERTY_KEYS.TIMEZONE, 'Asia/Taipei'),
     geminiModel: getOptionalProperty(CONFIG_PROPERTY_KEYS.GEMINI_MODEL, 'gemini-3.1-flash-lite'),
     defaultTargetCalories: Number(getOptionalProperty(CONFIG_PROPERTY_KEYS.DEFAULT_TARGET_CALORIES, '2100')),
-    defaultProteinTargetG: Number(getOptionalProperty(CONFIG_PROPERTY_KEYS.DEFAULT_PROTEIN_TARGET_G, '130'))
+    defaultProteinTargetG: Number(getOptionalProperty(CONFIG_PROPERTY_KEYS.DEFAULT_PROTEIN_TARGET_G, '130')),
+    richMenuImageFileId: getOptionalProperty(CONFIG_PROPERTY_KEYS.RICH_MENU_IMAGE_FILE_ID, '')
   };
 }
 
@@ -38,4 +40,3 @@ function getOptionalProperty(name, fallback) {
   var value = PropertiesService.getScriptProperties().getProperty(name);
   return value || fallback;
 }
-

@@ -18,7 +18,10 @@ var SHEET_SCHEMAS = {
     'user_note',
     'model_used',
     'raw_json',
-    'status'
+    'status',
+    'rule_matches',
+    'risk_tags',
+    'adjustment_reasons'
   ],
   UserProfile: [
     'user_id',
@@ -40,7 +43,11 @@ var SHEET_SCHEMAS = {
     'fat_per_unit',
     'note',
     'enabled',
-    'updated_at'
+    'updated_at',
+    'category',
+    'risk_tags',
+    'correction_policy',
+    'priority'
   ],
   BodyMetrics: [
     'id',
@@ -121,6 +128,14 @@ var SHEET_SCHEMAS = {
     'id',
     'timestamp',
     'expires_at',
+    'user_id',
+    'action_type',
+    'payload_json',
+    'status'
+  ],
+  UndoActions: [
+    'id',
+    'timestamp',
     'user_id',
     'action_type',
     'payload_json',
@@ -231,6 +246,17 @@ function appendPendingAction(record, config) {
   }, config);
 }
 
+function appendUndoAction(record, config) {
+  appendRowObject('UndoActions', {
+    id: record.id,
+    timestamp: record.timestamp || nowIso(config),
+    user_id: record.user_id || '',
+    action_type: record.action_type || '',
+    payload_json: record.payload_json || '',
+    status: record.status || 'active'
+  }, config);
+}
+
 function readSheetRows(sheetName, config) {
   var sheet = getSheetByName(sheetName, config);
   var values = sheet.getDataRange().getValues();
@@ -307,6 +333,17 @@ function applyMealNutritionCorrectionByRow(rowNumber, correction, note, config) 
     return null;
   }
 
+  appendUndoAction({
+    id: createUuid(),
+    timestamp: nowIso(config),
+    user_id: row.user_id,
+    action_type: 'meal_correction',
+    payload_json: stringifyJson({
+      meal: backupSheetRecord(row, 'MealLogs')
+    }),
+    status: 'active'
+  }, config);
+
   var nutrition = deriveCorrectedNutrition(row, correction || {});
   var sheet = getSheetByName('MealLogs', config);
   sheet.getRange(row._rowNumber, 10).setValue(nutrition.calories);
@@ -348,43 +385,41 @@ function deriveCorrectedNutrition(row, correction) {
   var meta = [];
 
   if (hasCalories && !hasProtein && !hasCarbs && !hasFat) {
-    var currentMacroCalories = macroCalories(before.protein, before.carbs, before.fat);
+    var calorieOnly = rebalanceMacrosToCalories({
+      protein: protein,
+      carbs: carbs,
+      fat: fat
+    }, calories, {
+      protein: true,
+      carbs: Boolean(correction.lockCarbs),
+      fat: Boolean(correction.lockFat)
+    }, inferMealCorrectionPolicy(row));
 
-    if (currentMacroCalories > 0) {
-      var scale = calories / currentMacroCalories;
-      protein = before.protein * scale;
-      carbs = before.carbs * scale;
-      fat = before.fat * scale;
-      meta.push('熱量修正，三大營養素依原比例同步調整');
-    }
+    protein = calorieOnly.protein;
+    carbs = calorieOnly.carbs;
+    fat = calorieOnly.fat;
+    calories = calorieOnly.calories;
+    meta.push('僅修正熱量，蛋白質先維持原值，熱量差額優先分配到碳水與脂肪');
   } else if (hasCalories) {
-    var fixedEnergy = (hasProtein ? protein * 4 : 0) +
-      (hasCarbs ? carbs * 4 : 0) +
-      (hasFat ? fat * 9 : 0);
-    var remainingEnergy = calories - fixedEnergy;
-    var originalRemainingEnergy = (hasProtein ? 0 : before.protein * 4) +
-      (hasCarbs ? 0 : before.carbs * 4) +
-      (hasFat ? 0 : before.fat * 9);
+    var mixedCorrection = rebalanceMacrosToCalories({
+      protein: protein,
+      carbs: carbs,
+      fat: fat
+    }, calories, {
+      protein: hasProtein || Boolean(correction.lockProtein) || (!hasProtein && (hasCarbs || hasFat)),
+      carbs: hasCarbs || Boolean(correction.lockCarbs),
+      fat: hasFat || Boolean(correction.lockFat)
+    }, inferMealCorrectionPolicy(row));
 
-    if (remainingEnergy > 0 && originalRemainingEnergy > 0) {
-      var remainingScale = remainingEnergy / originalRemainingEnergy;
+    protein = mixedCorrection.protein;
+    carbs = mixedCorrection.carbs;
+    fat = mixedCorrection.fat;
+    calories = mixedCorrection.calories;
 
-      if (!hasProtein) {
-        protein = before.protein * remainingScale;
-      }
-
-      if (!hasCarbs) {
-        carbs = before.carbs * remainingScale;
-      }
-
-      if (!hasFat) {
-        fat = before.fat * remainingScale;
-      }
-
-      meta.push('指定熱量與部分營養素，其餘營養素依原比例配合熱量調整');
-    } else if (remainingEnergy < 0) {
-      calories = macroCalories(protein, carbs, fat);
+    if (mixedCorrection.conflict) {
       meta.push('指定營養素換算熱量已高於指定熱量，改以營養素換算熱量為準');
+    } else {
+      meta.push('指定熱量與部分營養素，其餘熱量差額優先由未指定的碳水與脂肪調整');
     }
   } else if (hasProtein || hasCarbs || hasFat) {
     calories = macroCalories(protein, carbs, fat);
@@ -411,6 +446,118 @@ function deriveCorrectedNutrition(row, correction) {
 
 function macroCalories(protein, carbs, fat) {
   return toNumber(protein, 0) * 4 + toNumber(carbs, 0) * 4 + toNumber(fat, 0) * 9;
+}
+
+function rebalanceMacrosToCalories(macros, targetCalories, locked, policy) {
+  var result = {
+    protein: Math.max(0, toNumber(macros.protein, 0)),
+    carbs: Math.max(0, toNumber(macros.carbs, 0)),
+    fat: Math.max(0, toNumber(macros.fat, 0)),
+    calories: roundNonNegative(targetCalories),
+    conflict: false
+  };
+  var target = Math.max(0, toNumber(targetCalories, 0));
+  var delta = target - macroCalories(result.protein, result.carbs, result.fat);
+
+  if (Math.abs(delta) <= 1) {
+    return result;
+  }
+
+  if (delta > 0) {
+    addMacroEnergy(result, delta, locked, policy);
+  } else {
+    removeMacroEnergy(result, Math.abs(delta), locked);
+  }
+
+  var finalCalories = macroCalories(result.protein, result.carbs, result.fat);
+
+  if (Math.abs(finalCalories - target) > 2) {
+    result.calories = roundNonNegative(finalCalories);
+    result.conflict = true;
+  }
+
+  return result;
+}
+
+function addMacroEnergy(result, energy, locked, policy) {
+  var shares = getUnlockedEnergyShares(locked, policy);
+
+  if (shares.carbs > 0) {
+    result.carbs += (energy * shares.carbs) / 4;
+  }
+
+  if (shares.fat > 0) {
+    result.fat += (energy * shares.fat) / 9;
+  }
+
+  if (shares.protein > 0) {
+    result.protein += (energy * shares.protein) / 4;
+  }
+}
+
+function removeMacroEnergy(result, energy, locked) {
+  var remaining = energy;
+  remaining = reduceMacro(result, 'carbs', 4, remaining, locked.carbs);
+  remaining = reduceMacro(result, 'fat', 9, remaining, locked.fat);
+  remaining = reduceMacro(result, 'protein', 4, remaining, locked.protein);
+}
+
+function reduceMacro(result, key, kcalPerGram, energy, locked) {
+  if (locked || energy <= 0) {
+    return energy;
+  }
+
+  var currentEnergy = result[key] * kcalPerGram;
+  var removed = Math.min(currentEnergy, energy);
+  result[key] = Math.max(0, result[key] - removed / kcalPerGram);
+  return energy - removed;
+}
+
+function getUnlockedEnergyShares(locked, policy) {
+  var carbShare = locked.carbs ? 0 : policy.carbShare;
+  var fatShare = locked.fat ? 0 : policy.fatShare;
+  var proteinShare = locked.protein ? 0 : policy.proteinShare;
+  var total = carbShare + fatShare + proteinShare;
+
+  if (total <= 0 && !locked.protein) {
+    return { protein: 1, carbs: 0, fat: 0 };
+  }
+
+  if (total <= 0 && !locked.carbs) {
+    return { protein: 0, carbs: 1, fat: 0 };
+  }
+
+  if (total <= 0 && !locked.fat) {
+    return { protein: 0, carbs: 0, fat: 1 };
+  }
+
+  if (total <= 0) {
+    return { protein: 0, carbs: 0, fat: 0 };
+  }
+
+  return {
+    protein: proteinShare / total,
+    carbs: carbShare / total,
+    fat: fatShare / total
+  };
+}
+
+function inferMealCorrectionPolicy(row) {
+  var text = [
+    row.meal_name || '',
+    row.uncertainty || '',
+    row.raw_json || ''
+  ].join(' ');
+
+  if (/(炸|酥|雞排|炸雞|薯條|年糕|起司|芝士|奶油|白醬|青醬|漢堡|披薩|蛋塔|甜點|塔|派|醬)/.test(text)) {
+    return { proteinShare: 0, carbShare: 0.35, fatShare: 0.65 };
+  }
+
+  if (/(飯|麵|義大利麵|炒飯|炒麵|米粉|冬粉|麵包|吐司|貝果|地瓜|馬鈴薯|玉米|粥)/.test(text)) {
+    return { proteinShare: 0, carbShare: 0.65, fatShare: 0.35 };
+  }
+
+  return { proteinShare: 0, carbShare: 0.5, fatShare: 0.5 };
 }
 
 function previewMealNutritionCorrection(userId, correction, config) {
@@ -444,6 +591,16 @@ function cancelLastMealLog(userId, note, config) {
 
   var sheet = getSheetByName('MealLogs', config);
   var driveDeleteError = '';
+  appendUndoAction({
+    id: createUuid(),
+    timestamp: nowIso(config),
+    user_id: userId,
+    action_type: 'delete_meal',
+    payload_json: stringifyJson({
+      meal: backupSheetRecord(row, 'MealLogs')
+    }),
+    status: 'active'
+  }, config);
 
   if (row.drive_file_id) {
     try {
@@ -547,6 +704,128 @@ function getLatestPendingAction(userId, actionType, config) {
   return null;
 }
 
+function getLatestUndoAction(userId, config) {
+  var rows = readSheetRows('UndoActions', config);
+
+  for (var index = rows.length - 1; index >= 0; index -= 1) {
+    if (String(rows[index].user_id) === String(userId) &&
+      String(rows[index].status) === 'active') {
+      return rows[index];
+    }
+  }
+
+  return null;
+}
+
+function resolveUndoAction(rowNumber, status, config) {
+  var sheet = getSheetByName('UndoActions', config);
+  sheet.getRange(rowNumber, 6).setValue(status);
+  SpreadsheetApp.flush();
+}
+
+function undoLastAction(userId, config) {
+  var undo = getLatestUndoAction(userId, config);
+
+  if (!undo) {
+    return null;
+  }
+
+  var payload = extractJsonObject(undo.payload_json);
+  var meal = payload.meal || {};
+  var actionType = String(undo.action_type || '');
+  var restored;
+
+  if (actionType === 'meal_correction') {
+    restored = restoreMealLogRecord(meal, config);
+    resolveUndoAction(undo._rowNumber, restored ? 'undone' : 'failed', config);
+    return restored ? {
+      actionType: actionType,
+      meal: restored
+    } : null;
+  }
+
+  if (actionType === 'delete_meal') {
+    restored = restoreDeletedMealLog(meal, config);
+    resolveUndoAction(undo._rowNumber, restored ? 'undone' : 'failed', config);
+    return restored ? {
+      actionType: actionType,
+      meal: restored
+    } : null;
+  }
+
+  resolveUndoAction(undo._rowNumber, 'unsupported', config);
+  return null;
+}
+
+function backupSheetRecord(row, sheetName) {
+  var headers = SHEET_SCHEMAS[sheetName];
+  var backup = {};
+
+  headers.forEach(function (header) {
+    backup[header] = row[header] === undefined || row[header] === null ? '' : row[header];
+  });
+
+  return backup;
+}
+
+function valuesForSheetRecord(record, sheetName) {
+  return SHEET_SCHEMAS[sheetName].map(function (header) {
+    return record[header] === undefined || record[header] === null ? '' : record[header];
+  });
+}
+
+function findMealLogById(mealId, config) {
+  if (!mealId) {
+    return null;
+  }
+
+  return readSheetRows('MealLogs', config).filter(function (row) {
+    return String(row.id) === String(mealId);
+  })[0] || null;
+}
+
+function restoreMealLogRecord(meal, config) {
+  if (!meal || !meal.id) {
+    return null;
+  }
+
+  var sheet = getSheetByName('MealLogs', config);
+  var existing = findMealLogById(meal.id, config);
+  var values = valuesForSheetRecord(meal, 'MealLogs');
+
+  if (existing) {
+    sheet.getRange(existing._rowNumber, 1, 1, values.length).setValues([values]);
+  } else {
+    sheet.appendRow(values);
+  }
+
+  if (meal.drive_file_id) {
+    try {
+      restoreDriveFileById(meal.drive_file_id);
+    } catch (error) {
+      meal._driveRestoreError = error.message || String(error);
+    }
+  }
+
+  SpreadsheetApp.flush();
+  return findMealLogById(meal.id, config) || meal;
+}
+
+function restoreDeletedMealLog(meal, config) {
+  if (!meal || !meal.id) {
+    return null;
+  }
+
+  var existing = findMealLogById(meal.id, config);
+
+  if (existing && isActiveStatus(existing.status)) {
+    return existing;
+  }
+
+  meal.status = meal.status || 'active';
+  return restoreMealLogRecord(meal, config);
+}
+
 function resolvePendingAction(rowNumber, status, config) {
   var sheet = getSheetByName('PendingActions', config);
   sheet.getRange(rowNumber, 7).setValue(status);
@@ -592,6 +871,37 @@ function getDailySummariesByDateRange(userId, startDate, endDate, config) {
     return (!userId || String(row.user_id) === String(userId)) &&
       isDateInRange(row.date, startDate, endDate, config);
   });
+}
+
+function getApiUsageSummary(date, config) {
+  var rows = readSheetRows('ApiUsage', config);
+  var today = normalizeSheetDate(date, config);
+  var todayRows = rows.filter(function (row) {
+    return normalizeSheetDate(row.timestamp, config) === today;
+  });
+  var totalRows = rows;
+
+  return {
+    date: today,
+    todayCalls: todayRows.length,
+    todaySuccessfulCalls: countSuccessfulApiUsage(todayRows),
+    todayEstimatedCostUsd: sumApiUsageCost(todayRows),
+    totalCalls: totalRows.length,
+    totalSuccessfulCalls: countSuccessfulApiUsage(totalRows),
+    totalEstimatedCostUsd: sumApiUsageCost(totalRows)
+  };
+}
+
+function countSuccessfulApiUsage(rows) {
+  return rows.filter(function (row) {
+    return String(row.success).toUpperCase() === 'TRUE';
+  }).length;
+}
+
+function sumApiUsageCost(rows) {
+  return rows.reduce(function (sum, row) {
+    return sum + toNumber(row.estimated_cost_usd, 0);
+  }, 0);
 }
 
 function findLatestBodyMetric(userId, config) {
@@ -663,7 +973,11 @@ function getEnabledFoodRules(config) {
       protein_per_unit: toNumber(row.protein_per_unit, 0),
       carbs_per_unit: toNumber(row.carbs_per_unit, 0),
       fat_per_unit: toNumber(row.fat_per_unit, 0),
-      note: String(row.note || '').trim()
+      note: String(row.note || '').trim(),
+      category: String(row.category || '').trim(),
+      risk_tags: String(row.risk_tags || '').trim(),
+      correction_policy: String(row.correction_policy || '').trim(),
+      priority: toNumber(row.priority, 0)
     };
   });
 }

@@ -104,7 +104,8 @@ function callGeminiForBodyMetrics(imageBlob, config) {
   var response = callGeminiGenerateContent({
     prompt: prompt,
     blob: imageBlob,
-    responseMimeType: 'application/json'
+    responseMimeType: 'application/json',
+    maxAttempts: 4
   }, config);
   var text = getGeminiText(response);
   var parsed = normalizeBodyMetrics(extractJsonObject(text));
@@ -195,6 +196,53 @@ function callGeminiForWeeklyMemory(data, config) {
   return getGeminiText(response).trim();
 }
 
+function callGeminiForInstantWeeklySummary(data, config) {
+  var prompt = [
+    '你是私人減脂飲食追蹤 Bot 的即時週趨勢助手。',
+    '請根據本週當下紀錄，產生適合 LINE 訊息的具體趨勢建議。',
+    '這不是長期記憶，不要輸出 Markdown，不要提到檔案或雲端硬碟。',
+    '請把建議控制成 3 條，每條 22 個中文字以內，每條都要有明確用途，不要空泛鼓勵。',
+    '請用以下格式，不要加 Markdown 標題：',
+    '1. 一句話說明本週最大問題或優勢。',
+    '2. 一個下週可執行飲食動作。',
+    '3. 一個記錄或修正策略。',
+    '飲食建議要務實：例如雞胸、蛋、豆腐、魚、瘦肉、便當少飯加蛋白質、醬料分開、炸物減量。',
+    '不要做醫療診斷，不要要求極端飲食。',
+    '優先看：平均熱量、平均蛋白質、紀錄天數、低信心或修正紀錄可能造成的資料誤差。',
+    '',
+    JSON.stringify({
+      week_range: data.weekRange,
+      trend_snapshot: data.trendSnapshot,
+      logs: data.logs.slice(-20).map(function (row) {
+        return {
+          date: row.date,
+          meal_name: row.meal_name,
+          calories_kcal: getEffectiveMealCalories(row),
+          protein_g: row.protein_g,
+          carbs_g: row.carbs_g,
+          fat_g: row.fat_g,
+          confidence: row.confidence,
+          corrected: hasSheetValue(row.corrected_calories)
+        };
+      }),
+      daily_summaries: data.dailySummaries
+    })
+  ].join('\n');
+  var response = callGeminiGenerateContent({
+    prompt: prompt,
+    responseMimeType: 'text/plain',
+    maxAttempts: 3
+  }, config);
+  var usage = response.usageMetadata || {};
+
+  return {
+    text: sanitizeShortLineText(getGeminiText(response), 3),
+    inputTokens: usage.promptTokenCount || 0,
+    outputTokens: usage.candidatesTokenCount || 0,
+    estimatedCostUsd: estimateGeminiCost(usage.promptTokenCount || 0, usage.candidatesTokenCount || 0)
+  };
+}
+
 function callGeminiForCorrectionLearning(data, config) {
   var prompt = [
     '你是飲食紀錄系統的個人化修正學習助手。',
@@ -228,6 +276,132 @@ function callGeminiForCorrectionLearning(data, config) {
     responseMimeType: 'text/plain'
   }, config);
   return getGeminiText(response).trim();
+}
+
+function callGeminiForCoachAdvice(data, config) {
+  var prompt = [
+    '你是私人減脂飲食追蹤 Bot 的 AI 教練。',
+    '請根據使用者今天的飲食紀錄與目標，用繁體中文給出下一步飲食建議。',
+    '限制：不要做醫療診斷，不要誇大照片估算的精準度，不要要求使用者照做極端飲食。',
+    '回覆要短，適合 LINE 訊息，最多 8 行。',
+    '請優先回答：今天接下來怎麼吃、蛋白質是否需要補、熱量是否需要保守、外食怎麼選。',
+    '若資料是照片估算或信心偏低，請提醒「估算可能有誤差」，但不要一直道歉。',
+    '不要輸出 Markdown 標題，不要輸出 JSON。',
+    '',
+    JSON.stringify({
+      date: data.date,
+      target: {
+        calories_kcal: data.summary.targetCalories,
+        protein_g: data.summary.proteinTarget
+      },
+      current: {
+        calories_kcal: Math.round(data.summary.totalCalories),
+        protein_g: Math.round(data.summary.totalProtein),
+        carbs_g: Math.round(data.summary.totalCarbs),
+        fat_g: Math.round(data.summary.totalFat),
+        meal_count: data.summary.mealCount,
+        calorie_gap: Math.round(data.summary.calorieGap),
+        protein_gap: Math.round(data.summary.proteinGap)
+      },
+      profile: {
+        goal: data.profile.goal || '',
+        notes: data.profile.notes || ''
+      },
+      meals_today: data.logs.map(function (row) {
+        return {
+          meal_name: row.meal_name,
+          calories_kcal: getEffectiveMealCalories(row),
+          protein_g: row.protein_g,
+          carbs_g: row.carbs_g,
+          fat_g: row.fat_g,
+          confidence: row.confidence,
+          uncertainty: row.uncertainty,
+          user_note: row.user_note
+        };
+      })
+    })
+  ].join('\n');
+  var response = callGeminiGenerateContent({
+    prompt: prompt,
+    responseMimeType: 'text/plain',
+    maxAttempts: 3
+  }, config);
+  var usage = response.usageMetadata || {};
+
+  return {
+    text: getGeminiText(response).trim(),
+    inputTokens: usage.promptTokenCount || 0,
+    outputTokens: usage.candidatesTokenCount || 0,
+    estimatedCostUsd: estimateGeminiCost(usage.promptTokenCount || 0, usage.candidatesTokenCount || 0)
+  };
+}
+
+function callGeminiForMealCorrectionCommand(text, config) {
+  var prompt = [
+    '你是 LINE 飲食紀錄 Bot 的指令理解器。',
+    '任務：把使用者自然語言修正指令轉成嚴格 JSON。只處理「修正上一筆餐點熱量或 P/C/F」的意圖。',
+    '若不是餐點修正指令，intent 請填 unknown。',
+    '常見說法：這餐應該 700 左右、蛋白質大概 30、P 30、碳水抓 60、脂肪不要動、其他照熱量調整。',
+    '欄位說明：calories/protein/carbs/fat 為數字或 null；lock_protein/lock_carbs/lock_fat 表示使用者說不要動該營養素；adjust_remainder 表示其餘營養素配合熱量調整。',
+    '只能輸出 JSON，不要輸出 Markdown。',
+    'JSON 格式：{"intent":"meal_correction|unknown","calories":null,"protein":null,"carbs":null,"fat":null,"lock_protein":false,"lock_carbs":false,"lock_fat":false,"adjust_remainder":false,"confidence":"low|medium|high","reason":"string"}',
+    '',
+    '使用者訊息：' + String(text || '')
+  ].join('\n');
+  var response = callGeminiGenerateContent({
+    prompt: prompt,
+    responseMimeType: 'application/json',
+    maxAttempts: 2
+  }, config);
+  var parsed = normalizeMealCorrectionCommand(extractJsonObject(getGeminiText(response)));
+  var usage = response.usageMetadata || {};
+
+  return {
+    correction: parsed,
+    inputTokens: usage.promptTokenCount || 0,
+    outputTokens: usage.candidatesTokenCount || 0,
+    estimatedCostUsd: estimateGeminiCost(usage.promptTokenCount || 0, usage.candidatesTokenCount || 0)
+  };
+}
+
+function normalizeMealCorrectionCommand(parsed) {
+  parsed = parsed || {};
+
+  if (parsed.intent !== 'meal_correction') {
+    return null;
+  }
+
+  var correction = {};
+
+  if (parsed.calories !== null && parsed.calories !== undefined && parsed.calories !== '') {
+    correction.calories = Math.round(toNumber(parsed.calories, 0));
+  }
+
+  if (parsed.protein !== null && parsed.protein !== undefined && parsed.protein !== '') {
+    correction.protein = toNumber(parsed.protein, 0);
+  }
+
+  if (parsed.carbs !== null && parsed.carbs !== undefined && parsed.carbs !== '') {
+    correction.carbs = toNumber(parsed.carbs, 0);
+  }
+
+  if (parsed.fat !== null && parsed.fat !== undefined && parsed.fat !== '') {
+    correction.fat = toNumber(parsed.fat, 0);
+  }
+
+  correction.lockProtein = Boolean(parsed.lock_protein);
+  correction.lockCarbs = Boolean(parsed.lock_carbs);
+  correction.lockFat = Boolean(parsed.lock_fat);
+  correction.adjustRemainder = Boolean(parsed.adjust_remainder);
+  correction.source = 'ai_command_parser';
+  correction.parserConfidence = normalizeConfidence(parsed.confidence);
+  correction.parserReason = parsed.reason || '';
+
+  if (!hasAnyMealCorrection(correction)) {
+    return null;
+  }
+
+  return correction;
 }
 
 function formatBodyMetricForMemory(row) {
@@ -275,26 +449,56 @@ function callGeminiGenerateContent(input, config) {
       responseMimeType: input.responseMimeType || 'application/json'
     }
   };
-  var response = UrlFetchApp.fetch(
-    'https://generativelanguage.googleapis.com/v1beta/models/' +
-      encodeURIComponent(modelName) +
-      ':generateContent?key=' +
-      encodeURIComponent(config.geminiApiKey),
-    {
-      method: 'post',
-      contentType: 'application/json',
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
+  var url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+    encodeURIComponent(modelName) +
+    ':generateContent?key=' +
+    encodeURIComponent(config.geminiApiKey);
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  var maxAttempts = Math.max(1, Number(input.maxAttempts || 3));
+  var response;
+  var status;
+  var text;
+
+  for (var attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    response = UrlFetchApp.fetch(url, options);
+    status = response.getResponseCode();
+    text = response.getContentText();
+
+    if (status >= 200 && status < 300) {
+      return JSON.parse(text);
     }
-  );
-  var status = response.getResponseCode();
-  var text = response.getContentText();
+
+    if (!isRetryableGeminiStatus(status) || attempt >= maxAttempts) {
+      break;
+    }
+
+    Utilities.sleep(geminiRetryDelayMs(attempt));
+  }
 
   if (status < 200 || status >= 300) {
-    throw new Error('Gemini request failed: ' + status + ' ' + text);
+    throw new Error('Gemini request failed after ' + maxAttempts + ' attempt(s): ' + status + ' ' + text);
   }
 
   return JSON.parse(text);
+}
+
+function isRetryableGeminiStatus(status) {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function geminiRetryDelayMs(attempt) {
+  var delays = [700, 1500, 3000, 5000];
+  return delays[Math.min(Math.max(attempt - 1, 0), delays.length - 1)];
+}
+
+function isTransientGeminiError(error) {
+  var message = String(error && (error.message || error) || '');
+  return /Gemini request failed/.test(message) && /(429|500|502|503|504|UNAVAILABLE|RESOURCE_EXHAUSTED)/.test(message);
 }
 
 function getGeminiText(response) {
@@ -308,6 +512,21 @@ function getGeminiText(response) {
   }
 
   return text;
+}
+
+function sanitizeShortLineText(text, maxLines) {
+  var lines = String(text || '')
+    .replace(/^#+\s*/gm, '')
+    .replace(/\*\*/g, '')
+    .split(/\r?\n/)
+    .map(function (line) {
+      return line.trim();
+    })
+    .filter(function (line) {
+      return line;
+    });
+
+  return lines.slice(0, maxLines || 5).join('\n');
 }
 
 function normalizeMealEstimate(estimate) {
@@ -475,57 +694,109 @@ function formatFoodRulesForPrompt(rules) {
       'protein_g=' + rule.protein_per_unit,
       'carbs_g=' + rule.carbs_per_unit,
       'fat_g=' + rule.fat_per_unit,
+      'category=' + (rule.category || inferFoodRuleCategory(rule)),
+      'risk_tags=' + (rule.risk_tags || inferFoodRuleRiskTags(rule).join('|')),
       'note=' + rule.note
     ].join(', ');
-  }).join('\n');
+  }).join('\n') + '\n請把 FoodRules 當作合理範圍參考，不要因單一關鍵字忽略照片中的其他食物。';
 }
 
 function applyFoodRulesToEstimate(estimate, rules) {
+  ensureFoodRuleDiagnostics(estimate);
+
   if (!rules || rules.length === 0) {
+    estimate.risk_tags = uniqueStrings(estimate.risk_tags.concat(inferRiskTagsFromEstimate(estimate)));
     return estimate;
   }
 
-  var matched = findMatchingFoodRule(estimate, rules);
+  var matches = findMatchingFoodRules(estimate, rules).slice(0, 5);
 
-  if (!matched) {
+  if (!matches.length) {
+    estimate.risk_tags = uniqueStrings(estimate.risk_tags.concat(inferRiskTagsFromEstimate(estimate)));
     return estimate;
   }
 
-  var units = estimateRuleUnits(estimate, matched);
+  var primary = matches[0];
+  var riskTags = uniqueStrings(
+    inferRiskTagsFromEstimate(estimate).concat(
+      matches.reduce(function (tags, match) {
+        return tags.concat(match.riskTags);
+      }, [])
+    )
+  );
+  var benchmark = buildFoodRuleBenchmark(primary.rule, primary.units);
+  var range = buildFoodRuleRange(benchmark, riskTags);
+  var beforeCalories = toNumber(estimate.total.calories_kcal, 0);
 
-  if (!units || units <= 0) {
-    return estimate;
+  estimate.rule_matches = matches.map(function (match) {
+    return match.rule.food_keyword + ' x ' + match.units + ' ' + match.rule.portion_unit;
+  });
+  estimate.risk_tags = riskTags;
+
+  if (beforeCalories > 0 && beforeCalories < range.caloriesMin) {
+    raiseEstimateCaloriesWithFoodRulePolicy(estimate, range.caloriesMin, riskTags);
+    estimate.adjustment_reasons.push(
+      'FoodRules 下限上修：' + primary.rule.food_keyword + ' 參考下限 ' + range.caloriesMin + ' kcal'
+    );
   }
 
-  var adjustedCalories = Math.round(matched.calories_per_unit * units);
+  applyFoodRuleMacroFloors(estimate, range);
 
-  if (!adjustedCalories || adjustedCalories <= 0) {
-    return estimate;
+  if (beforeCalories > 0 && beforeCalories > range.caloriesMax * 1.25) {
+    estimate.adjustment_reasons.push(
+      'FoodRules 警示：估算高於 ' + primary.rule.food_keyword + ' 常見範圍，未自動下修'
+    );
+    estimate.confidence = 'low';
   }
 
-  estimate.total = {
-    calories_kcal: adjustedCalories,
-    protein_g: Math.round(matched.protein_per_unit * units),
-    carbs_g: Math.round(matched.carbs_per_unit * units),
-    fat_g: Math.round(matched.fat_per_unit * units)
-  };
   estimate.uncertainty_factors = (estimate.uncertainty_factors || []).slice(0, 6);
-  estimate.uncertainty_factors.push('已套用 FoodRules：' + matched.food_keyword + '，估計 ' + units + ' ' + matched.portion_unit);
+
+  if (estimate.adjustment_reasons.length) {
+    estimate.uncertainty_factors.push('FoodRules 診斷：' + estimate.adjustment_reasons.join('；'));
+    estimate.confidence = estimate.confidence === 'high' ? 'medium' : estimate.confidence;
+  }
 
   return estimate;
 }
 
-function findMatchingFoodRule(estimate, rules) {
-  var haystack = [
-    estimate.meal_name,
-    (estimate.items || []).map(function (item) {
-      return item.name;
-    }).join(' ')
-  ].join(' ');
+function ensureFoodRuleDiagnostics(estimate) {
+  estimate.rule_matches = estimate.rule_matches || [];
+  estimate.risk_tags = estimate.risk_tags || [];
+  estimate.adjustment_reasons = estimate.adjustment_reasons || [];
+}
+
+function findMatchingFoodRules(estimate, rules) {
+  var haystack = getFoodRuleHaystack(estimate);
 
   return rules.filter(function (rule) {
-    return haystack.indexOf(rule.food_keyword) >= 0;
-  })[0] || null;
+    return rule.food_keyword && haystack.indexOf(rule.food_keyword) >= 0;
+  }).map(function (rule) {
+    return {
+      rule: rule,
+      units: estimateRuleUnits(estimate, rule),
+      category: rule.category || inferFoodRuleCategory(rule),
+      riskTags: parseFoodRuleRiskTags(rule)
+    };
+  }).filter(function (match) {
+    return match.units > 0;
+  }).sort(function (a, b) {
+    var priorityDiff = toNumber(b.rule.priority, 0) - toNumber(a.rule.priority, 0);
+
+    if (priorityDiff !== 0) {
+      return priorityDiff;
+    }
+
+    return String(b.rule.food_keyword).length - String(a.rule.food_keyword).length;
+  });
+}
+
+function getFoodRuleHaystack(estimate) {
+  return [
+    estimate.meal_name,
+    (estimate.items || []).map(function (item) {
+      return [item.name, item.portion_description].join(' ');
+    }).join(' ')
+  ].join(' ');
 }
 
 function estimateRuleUnits(estimate, rule) {
@@ -546,6 +817,157 @@ function estimateRuleUnits(estimate, rule) {
   }
 
   return 1;
+}
+
+function buildFoodRuleBenchmark(rule, units) {
+  return {
+    calories: Math.round(toNumber(rule.calories_per_unit, 0) * units),
+    protein: Math.round(toNumber(rule.protein_per_unit, 0) * units),
+    carbs: Math.round(toNumber(rule.carbs_per_unit, 0) * units),
+    fat: Math.round(toNumber(rule.fat_per_unit, 0) * units)
+  };
+}
+
+function buildFoodRuleRange(benchmark, riskTags) {
+  var highVariance = containsAny(riskTags, ['fried', 'sauce', 'cheese', 'dessert', 'hotpot', 'shared_portion']);
+  var minFactor = highVariance ? 0.75 : 0.8;
+  var maxFactor = highVariance ? 1.5 : 1.35;
+
+  return {
+    caloriesMin: Math.max(80, Math.round(benchmark.calories * minFactor)),
+    caloriesMax: Math.max(120, Math.round(benchmark.calories * maxFactor)),
+    proteinMin: Math.round(benchmark.protein * 0.65),
+    carbsMin: Math.round(benchmark.carbs * 0.5),
+    fatMin: Math.round(benchmark.fat * 0.55)
+  };
+}
+
+function applyFoodRuleMacroFloors(estimate, range) {
+  if (range.proteinMin > 0 && toNumber(estimate.total.protein_g, 0) < range.proteinMin) {
+    estimate.total.protein_g = range.proteinMin;
+    estimate.adjustment_reasons.push('FoodRules 蛋白質下限上修至 ' + range.proteinMin + 'g');
+  }
+
+  if (range.carbsMin > 0 && toNumber(estimate.total.carbs_g, 0) < range.carbsMin) {
+    estimate.total.carbs_g = range.carbsMin;
+    estimate.adjustment_reasons.push('FoodRules 碳水下限上修至 ' + range.carbsMin + 'g');
+  }
+
+  if (range.fatMin > 0 && toNumber(estimate.total.fat_g, 0) < range.fatMin) {
+    estimate.total.fat_g = range.fatMin;
+    estimate.adjustment_reasons.push('FoodRules 脂肪下限上修至 ' + range.fatMin + 'g');
+  }
+
+  var macroEnergy = macroCaloriesFromEstimate(estimate);
+
+  if (macroEnergy > toNumber(estimate.total.calories_kcal, 0)) {
+    estimate.total.calories_kcal = Math.round(macroEnergy);
+    estimate.adjustment_reasons.push('FoodRules 宏量營養素下限使熱量同步上修');
+  }
+}
+
+function raiseEstimateCaloriesWithFoodRulePolicy(estimate, targetCalories, riskTags) {
+  var currentCalories = toNumber(estimate.total.calories_kcal, 0);
+  var delta = Math.max(0, targetCalories - currentCalories);
+  var shares = foodRuleEnergyShares(riskTags);
+
+  if (delta <= 0) {
+    return;
+  }
+
+  estimate.total.calories_kcal = Math.round(targetCalories);
+  estimate.total.carbs_g = roundNonNegative(toNumber(estimate.total.carbs_g, 0) + (delta * shares.carbs) / 4);
+  estimate.total.fat_g = roundNonNegative(toNumber(estimate.total.fat_g, 0) + (delta * shares.fat) / 9);
+
+  if (shares.protein > 0) {
+    estimate.total.protein_g = roundNonNegative(toNumber(estimate.total.protein_g, 0) + (delta * shares.protein) / 4);
+  }
+}
+
+function foodRuleEnergyShares(riskTags) {
+  if (containsAny(riskTags, ['fried', 'sauce', 'cheese', 'dessert'])) {
+    return { protein: 0, carbs: 0.35, fat: 0.65 };
+  }
+
+  if (containsAny(riskTags, ['starch', 'rice_noodle', 'pasta'])) {
+    return { protein: 0, carbs: 0.7, fat: 0.3 };
+  }
+
+  return { protein: 0, carbs: 0.5, fat: 0.5 };
+}
+
+function macroCaloriesFromEstimate(estimate) {
+  return toNumber(estimate.total.protein_g, 0) * 4 +
+    toNumber(estimate.total.carbs_g, 0) * 4 +
+    toNumber(estimate.total.fat_g, 0) * 9;
+}
+
+function parseFoodRuleRiskTags(rule) {
+  var explicit = String(rule.risk_tags || '').trim();
+  var tags = explicit ? explicit.split(/[,\s;；|｜]+/) : [];
+  return uniqueStrings(tags.concat(inferFoodRuleRiskTags(rule)));
+}
+
+function inferRiskTagsFromEstimate(estimate) {
+  return inferRiskTagsFromText(getFoodRuleHaystack(estimate));
+}
+
+function inferFoodRuleRiskTags(rule) {
+  var text = [
+    rule.food_keyword || '',
+    rule.category || '',
+    rule.note || ''
+  ].join(' ');
+
+  return inferRiskTagsFromText(text);
+}
+
+function inferRiskTagsFromText(text) {
+  var tags = [];
+  var value = String(text || '');
+
+  if (/(炸|酥|雞排|炸雞|薯條|鍋貼|蔥油餅|蔥抓餅)/.test(value)) tags.push('fried');
+  if (/(醬|麻醬|沙茶|白醬|青醬|咖哩|滷肉|肉燥)/.test(value)) tags.push('sauce');
+  if (/(起司|芝士|奶油)/.test(value)) tags.push('cheese');
+  if (/(飯|麵|義大利麵|炒飯|炒麵|米粉|冬粉|吐司|麵包|貝果|地瓜|馬鈴薯|玉米|粥)/.test(value)) tags.push('starch');
+  if (/(義大利麵|白醬|青醬|紅醬)/.test(value)) tags.push('pasta');
+  if (/(火鍋|鍋|涮涮鍋|麻辣鍋|鍋物|火鍋料)/.test(value)) tags.push('hotpot');
+  if (/(甜點|蛋塔|塔|派|奶茶|珍珠|剉冰|豆花|車輪餅|雞蛋糕)/.test(value)) tags.push('dessert');
+  if (/(拼盤|分享|多人|套餐)/.test(value)) tags.push('shared_portion');
+
+  return uniqueStrings(tags);
+}
+
+function inferFoodRuleCategory(rule) {
+  var tags = inferFoodRuleRiskTags(rule);
+
+  if (containsAny(tags, ['fried'])) return 'fried_food';
+  if (containsAny(tags, ['dessert'])) return 'dessert';
+  if (containsAny(tags, ['hotpot'])) return 'hotpot';
+  if (containsAny(tags, ['pasta'])) return 'pasta';
+  if (containsAny(tags, ['starch'])) return 'rice_noodle';
+  return 'general';
+}
+
+function containsAny(values, candidates) {
+  return candidates.some(function (candidate) {
+    return values.indexOf(candidate) >= 0;
+  });
+}
+
+function uniqueStrings(values) {
+  var seen = {};
+
+  return (values || []).map(function (value) {
+    return String(value || '').trim();
+  }).filter(function (value) {
+    if (!value || seen[value]) {
+      return false;
+    }
+
+    seen[value] = true;
+    return true;
+  });
 }
 
 function extractCountFromEstimate(estimate) {

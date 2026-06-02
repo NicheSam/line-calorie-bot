@@ -124,6 +124,118 @@ function generateWeeklyMemory(userId, referenceDate, config) {
   };
 }
 
+function generateInstantWeeklySummary(userId, referenceDate, config) {
+  var weekRange = getWeekRange(referenceDate || todayDate(config), config);
+  var logs = getActiveMealLogsByDateRange(userId, weekRange.startDate, weekRange.endDate, config);
+  var dailySummaries = getDailySummariesByDateRange(userId, weekRange.startDate, weekRange.endDate, config);
+  var trendSnapshot = buildTrendSnapshot(logs, [], [], dailySummaries, weekRange, config);
+  var baseText = formatInstantWeeklySummaryBase(trendSnapshot, logs, weekRange);
+  var adviceText = '';
+  var usage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedCostUsd: 0,
+    success: false,
+    error: ''
+  };
+
+  if (logs.length > 0) {
+    try {
+      var advice = callGeminiForInstantWeeklySummary({
+        weekRange: weekRange,
+        trendSnapshot: trendSnapshot,
+        logs: logs,
+        dailySummaries: dailySummaries
+      }, config);
+      adviceText = advice.text;
+      usage.inputTokens = advice.inputTokens;
+      usage.outputTokens = advice.outputTokens;
+      usage.estimatedCostUsd = advice.estimatedCostUsd;
+      usage.success = true;
+    } catch (error) {
+      usage.error = error.message || String(error);
+      adviceText = formatInstantWeeklyFallbackAdvice(trendSnapshot);
+    }
+  } else {
+    adviceText = '本週還沒有 active 餐點紀錄，暫時無法判斷飲食趨勢。';
+    usage.success = true;
+  }
+
+  return {
+    text: [baseText, '', '趨勢建議', adviceText].join('\n'),
+    adviceText: adviceText,
+    weekRange: weekRange,
+    trendSnapshot: trendSnapshot,
+    correctedCount: countCorrectedLogs(logs),
+    lowConfidenceCount: countLowConfidenceLogs(logs),
+    usage: usage
+  };
+}
+
+function formatInstantWeeklySummaryBase(trend, logs, weekRange) {
+  var lines = [
+    '本週即時總結',
+    weekRange.startDate + ' - ' + weekRange.endDate,
+    '',
+    '紀錄：' + (trend.meal_count || 0) + ' 餐 / ' + (trend.logged_days || 0) + ' 天',
+    '總熱量：約 ' + (trend.total_calories || 0) + ' kcal',
+    '平均熱量：約 ' + (trend.avg_calories_per_logged_day || 0) + ' kcal / 紀錄日',
+    '平均蛋白質：約 ' + (trend.avg_protein_per_logged_day || 0) + ' g / 紀錄日',
+    '總 P/C/F：約 ' + (trend.total_protein_g || 0) + ' / ' + (trend.total_carbs_g || 0) + ' / ' + (trend.total_fat_g || 0) + ' g'
+  ];
+  var correctedCount = countCorrectedLogs(logs);
+  var lowConfidenceCount = countLowConfidenceLogs(logs);
+
+  if (correctedCount || lowConfidenceCount) {
+    lines.push('');
+    lines.push('資料品質：修正 ' + correctedCount + ' 筆，低信心 ' + lowConfidenceCount + ' 筆');
+  }
+
+  return lines.join('\n');
+}
+
+function countCorrectedLogs(logs) {
+  return (logs || []).filter(function (row) {
+    return hasSheetValue(row.corrected_calories);
+  }).length;
+}
+
+function countLowConfidenceLogs(logs) {
+  return (logs || []).filter(function (row) {
+    return String(row.confidence || '').toLowerCase() === 'low';
+  }).length;
+}
+
+function formatInstantWeeklyFallbackAdvice(trend) {
+  var lines = [];
+  var avgCalories = trend.avg_calories_per_logged_day || 0;
+  var avgProtein = trend.avg_protein_per_logged_day || 0;
+  var loggedDays = trend.logged_days || 0;
+
+  if (loggedDays < 4) {
+    lines.push('紀錄天數偏少，趨勢先當參考。');
+    lines.push('下週先固定拍午餐與晚餐。');
+  } else {
+    lines.push('本週紀錄量可做初步檢討。');
+  }
+
+  if (avgProtein < 100) {
+    lines.push('每餐先補雞胸、蛋、魚或豆腐。');
+  } else {
+    lines.push('蛋白質有基礎，改控油脂與醬料。');
+  }
+
+  if (avgCalories > 2200) {
+    lines.push('少炸物甜飲，便當少飯醬分開。');
+  } else if (avgCalories < 1600 && loggedDays >= 3) {
+    lines.push('熱量偏低時檢查飲料點心漏記。');
+  } else {
+    lines.push('用「改700 P30」修正低信心餐。');
+  }
+
+  return lines.slice(0, 3).join('\n');
+}
+
 function generateCorrectionLearningMemory(userId, referenceDate, config) {
   var endDate = referenceDate || todayDate(config);
   var startDate = addDaysToDateString(endDate, -29, config);

@@ -99,6 +99,15 @@ function trashDriveFileById(fileId) {
   return true;
 }
 
+function restoreDriveFileById(fileId) {
+  if (!fileId) {
+    return false;
+  }
+
+  DriveApp.getFileById(fileId).setTrashed(false);
+  return true;
+}
+
 function saveDailyMemoryMarkdown(markdown, userId, date, config) {
   var rootFolder = getRootFolder(config);
   var folder = getNestedFolder(rootFolder, ['memory_md', 'daily']);

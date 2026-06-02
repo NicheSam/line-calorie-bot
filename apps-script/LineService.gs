@@ -9,6 +9,23 @@ function verifyLineSignature(rawBody, signature, channelSecret) {
 }
 
 function replyToLine(replyToken, text, config) {
+  replyMessagesToLine(replyToken, [
+    {
+      type: 'text',
+      text: truncateText(text, 4900)
+    }
+  ], config);
+}
+
+function replyFlexToLine(replyToken, flexMessage, fallbackText, config) {
+  try {
+    replyMessagesToLine(replyToken, [flexMessage], config);
+  } catch (error) {
+    replyToLine(replyToken, fallbackText, config);
+  }
+}
+
+function replyMessagesToLine(replyToken, messages, config) {
   var response = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'post',
     contentType: 'application/json',
@@ -17,12 +34,7 @@ function replyToLine(replyToken, text, config) {
     },
     payload: JSON.stringify({
       replyToken: replyToken,
-      messages: [
-        {
-          type: 'text',
-          text: truncateText(text, 4900)
-        }
-      ]
+      messages: messages
     }),
     muteHttpExceptions: true
   });
