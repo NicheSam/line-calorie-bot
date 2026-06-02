@@ -11,6 +11,7 @@ GEMINI_API_KEY=replace_with_your_gemini_api_key
 GEMINI_MODEL=gemini-3.1-flash-lite
 SHEET_ID=replace_with_your_google_sheet_id
 DRIVE_ROOT_FOLDER_ID=replace_with_your_drive_folder_id
+RICH_MENU_IMAGE_FILE_ID=replace_with_your_rich_menu_image_file_id
 TIMEZONE=Asia/Taipei
 DEFAULT_TARGET_CALORIES=2100
 DEFAULT_PROTEIN_TARGET_G=130
@@ -20,5 +21,5 @@ DEFAULT_PROTEIN_TARGET_G=130
 
 - `SHEET_ID` 來自 Google Sheet URL：`/spreadsheets/d/{SHEET_ID}/edit`
 - `DRIVE_ROOT_FOLDER_ID` 來自 Drive 資料夾 URL：`/folders/{DRIVE_ROOT_FOLDER_ID}`
+- `RICH_MENU_IMAGE_FILE_ID` 來自 Rich Menu 圖片的 Drive file URL：`/file/d/{RICH_MENU_IMAGE_FILE_ID}/view`
 - `GEMINI_MODEL` 需使用你的 Gemini API key 可呼叫的模型。
-
