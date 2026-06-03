@@ -4,6 +4,21 @@
 
 這個專案的重點不是做一個通用商業產品，而是整理一套「用 Codex 協作，自己部署、自己測試、自己迭代 UX」的個人健康追蹤工具。
 
+## 建議閱讀路線
+
+如果你只是想先了解這個 Bot 能做什麼，先看本 README。
+
+如果你想自己部署，建議照這個順序讀：
+
+1. [用 Codex 協作部署 LINE 熱量追蹤 Bot](docs/LINE_BOT_Codex_協作部署教學.md)
+   - 從設定目標、建立帳號、貼 Apps Script、部署 webhook、除錯到 UX 迭代的完整流程。
+2. [部署檢查表](docs/DEPLOY_CHECKLIST.md)
+   - 部署時逐項確認 LINE、Apps Script、Google Sheets、Drive、Gemini、Rich Menu 是否完成。
+3. [Script Properties 範例](examples/script-properties.example.md)
+   - Apps Script 需要設定哪些環境值，以及哪些值不能提交到 GitHub。
+
+這個 repo 不只是一包程式碼，也包含一份「如何跟 Codex 協作把個人 LINE Bot 做出來」的部署教學。
+
 ## 目前體驗
 
 使用者主要透過 LINE Rich Menu 操作：
@@ -158,6 +173,7 @@ setupSheets()
 setupChineseViews()
 setupDailyMemoryTrigger()
 setupWeeklyMemoryTrigger()
+setupLineRichMenu()
 ```
 
 9. 部署 Apps Script Web App。
