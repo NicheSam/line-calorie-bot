@@ -212,6 +212,7 @@ function handleNutritionLabelImage(event, config, context) {
   }
 
   var label = geminiResult.estimate;
+  var labelMealName = buildNutritionLabelMealName(label);
 
   appendMealLog({
     id: createUuid(),
@@ -221,7 +222,7 @@ function handleNutritionLabelImage(event, config, context) {
     line_message_id: messageId,
     drive_file_id: driveFile.fileId,
     drive_url: driveFile.driveUrl,
-    meal_name: '營養標示：' + label.product_name,
+    meal_name: labelMealName,
     ai_calories: label.total.calories_kcal,
     corrected_calories: '',
     protein_g: label.total.protein_g,
@@ -240,7 +241,8 @@ function handleNutritionLabelImage(event, config, context) {
 
   var summary = calculateDailySummary(userId, date, config);
   upsertDailySummary(summary, config);
-  replyToLine(event.replyToken, formatNutritionLabelReply(label, summary), config);
+  var nutritionFallbackText = formatNutritionLabelReply(label, summary);
+  replyMealEstimateFlex(event.replyToken, buildNutritionLabelEstimate(label, labelMealName), summary, nutritionFallbackText, config);
   appendSystemEvent({
     timestamp: timestamp,
     user_id: userId,
@@ -883,6 +885,34 @@ function formatNutritionLabelReply(label, summary) {
   lines.push('');
   lines.push('可回覆：改700、改700 P30、不記錄、今日');
   return lines.join('\n');
+}
+
+function buildNutritionLabelEstimate(label, labelMealName) {
+  return {
+    meal_name: labelMealName || buildNutritionLabelMealName(label),
+    total: {
+      calories_kcal: label.total.calories_kcal,
+      protein_g: label.total.protein_g,
+      carbs_g: label.total.carbs_g,
+      fat_g: label.total.fat_g
+    },
+    confidence: label.confidence,
+    uncertainty_factors: label.uncertainty_factors || [],
+    sourceType: 'nutrition_label',
+    servingBasis: label.serving_basis,
+    servingSize: label.serving_size || '',
+    servingsPerPackage: label.servings_per_package || 0
+  };
+}
+
+function buildNutritionLabelMealName(label) {
+  var productName = String(label && label.product_name ? label.product_name : '').trim();
+
+  if (!productName || productName.toLowerCase() === 'unknown') {
+    productName = '營養標示食品';
+  }
+
+  return '營養標示：' + productName;
 }
 
 function formatNutritionLabelNote(label) {

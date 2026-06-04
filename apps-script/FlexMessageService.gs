@@ -17,6 +17,26 @@ function buildMealEstimateFlexMessage(estimate, summary) {
   var fat = Math.round(toNumber(estimate.total.fat_g, 0));
   var confidence = translateConfidence(estimate.confidence);
   var progress = progressPercent(summary.totalCalories, summary.targetCalories);
+  var metaRows = buildMealEstimateMetaRows(estimate);
+  var bodyContents = [
+    flexMetricRow('熱量', calories + ' kcal', true),
+    flexMetricRow('蛋白質', protein + ' g', false),
+    flexMacroLine(protein, carbs, fat)
+  ];
+
+  if (metaRows) {
+    bodyContents.push(metaRows);
+  }
+
+  bodyContents = bodyContents.concat([
+    flexSeparator(),
+    flexText('今日進度', '#333333', 'md', 'bold'),
+    flexProgressBar(progress),
+    flexMetricRow('已攝取', Math.round(summary.totalCalories) + ' / ' + summary.targetCalories + ' kcal', false),
+    flexMetricRow('蛋白質', Math.round(summary.totalProtein) + ' / ' + summary.proteinTarget + ' g', false),
+    flexMetricRow('信心', confidence, false),
+    flexHintText(buildMealFlexHint(estimate, summary))
+  ]);
 
   return {
     type: 'flex',
@@ -38,18 +58,7 @@ function buildMealEstimateFlexMessage(estimate, summary) {
         type: 'box',
         layout: 'vertical',
         spacing: 'md',
-        contents: [
-          flexMetricRow('熱量', calories + ' kcal', true),
-          flexMetricRow('蛋白質', protein + ' g', false),
-          flexMacroLine(protein, carbs, fat),
-          flexSeparator(),
-          flexText('今日進度', '#333333', 'md', 'bold'),
-          flexProgressBar(progress),
-          flexMetricRow('已攝取', Math.round(summary.totalCalories) + ' / ' + summary.targetCalories + ' kcal', false),
-          flexMetricRow('蛋白質', Math.round(summary.totalProtein) + ' / ' + summary.proteinTarget + ' g', false),
-          flexMetricRow('信心', confidence, false),
-          flexHintText(buildMealFlexHint(estimate, summary))
-        ]
+        contents: bodyContents
       },
       footer: {
         type: 'box',
@@ -61,6 +70,29 @@ function buildMealEstimateFlexMessage(estimate, summary) {
         ]
       }
     }
+  };
+}
+
+function buildMealEstimateMetaRows(estimate) {
+  var contents = [];
+
+  if (estimate.sourceType === 'nutrition_label') {
+    contents.push(flexMetricRow('來源', '營養標示（' + translateServingBasis(estimate.servingBasis) + '）', false));
+
+    if (estimate.servingSize) {
+      contents.push(flexMetricRow('份量', estimate.servingSize, false));
+    }
+  }
+
+  if (contents.length === 0) {
+    return null;
+  }
+
+  return {
+    type: 'box',
+    layout: 'vertical',
+    spacing: 'xs',
+    contents: contents
   };
 }
 
@@ -309,7 +341,8 @@ function buildMealFlexHint(estimate, summary) {
       carbs: estimate.total.carbs_g,
       fat: estimate.total.fat_g,
       confidence: estimate.confidence,
-      sourceType: 'meal_photo'
+      servingBasis: estimate.servingBasis,
+      sourceType: estimate.sourceType || 'meal_photo'
     }, summary);
   }
 
