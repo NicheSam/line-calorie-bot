@@ -518,8 +518,12 @@ function handleTextMessage(event, config) {
 
   var mealCorrection = parseMealCorrectionText(text);
 
-  if (!mealCorrection && shouldTryAiMealCorrectionParser(text)) {
-    mealCorrection = parseMealCorrectionTextWithAi(text, event, config, timestamp);
+  if (shouldTryAiMealCorrectionParser(text) &&
+    (!mealCorrection || shouldEscalateParsedMealCorrectionToAi(text, mealCorrection))) {
+    mealCorrection = mergeMealCorrections(
+      mealCorrection,
+      parseMealCorrectionTextWithAi(text, event, config, timestamp)
+    );
   }
 
   if (mealCorrection) {
@@ -1186,6 +1190,39 @@ function shouldTryAiMealCorrectionParser(text) {
   return /(這餐|這筆|上一筆|剛剛|剛才|應該|大概|大約|差不多|左右|抓|算|估|記|當作|改|修|調|熱量|卡|大卡|kcal|蛋白|蛋白質|碳水|脂肪|油脂|\bP\b|\bC\b|\bF\b)/i.test(normalizedText);
 }
 
+function shouldEscalateParsedMealCorrectionToAi(text, correction) {
+  var normalizedText = normalizeMealCorrectionCommandText(text);
+  var lockMacros = parseLockedMacroFields(normalizedText);
+
+  if (lockMacros.calories && !correction.lockCalories) {
+    return true;
+  }
+
+  if (lockMacros.protein && !correction.lockProtein && correction.protein === undefined) {
+    return true;
+  }
+
+  if (lockMacros.carbs && !correction.lockCarbs && correction.carbs === undefined) {
+    return true;
+  }
+
+  if (lockMacros.fat && !correction.lockFat && correction.fat === undefined) {
+    return true;
+  }
+
+  if (/(不動|不用動|不要動|不變|維持|照舊|保持|不用改|不要改|不重算|不用重算|不要重算|別重算)/.test(normalizedText) &&
+    !(correction.lockCalories || correction.lockProtein || correction.lockCarbs || correction.lockFat)) {
+    return true;
+  }
+
+  if (/(其他|剩下|其餘).*(配合|調整|照.*熱量|照.*總熱量)|配合.*(熱量|總熱量)/.test(normalizedText) &&
+    !correction.adjustRemainder) {
+    return true;
+  }
+
+  return false;
+}
+
 function parseMealCorrectionTextWithAi(text, event, config, timestamp) {
   try {
     var result = callGeminiForMealCorrectionCommand(text, config);
@@ -1215,6 +1252,37 @@ function parseMealCorrectionTextWithAi(text, event, config, timestamp) {
     }, config);
     return null;
   }
+}
+
+function mergeMealCorrections(localCorrection, aiCorrection) {
+  if (!localCorrection) {
+    return aiCorrection;
+  }
+
+  if (!aiCorrection) {
+    return localCorrection;
+  }
+
+  var merged = {};
+  copyMealCorrectionFields(merged, localCorrection, false);
+  copyMealCorrectionFields(merged, aiCorrection, true);
+  merged.lockCalories = Boolean(localCorrection.lockCalories || aiCorrection.lockCalories);
+  merged.lockProtein = Boolean(localCorrection.lockProtein || aiCorrection.lockProtein);
+  merged.lockCarbs = Boolean(localCorrection.lockCarbs || aiCorrection.lockCarbs);
+  merged.lockFat = Boolean(localCorrection.lockFat || aiCorrection.lockFat);
+  merged.adjustRemainder = Boolean(localCorrection.adjustRemainder || aiCorrection.adjustRemainder);
+  merged.source = aiCorrection.source || localCorrection.source || 'local_command_parser';
+  merged.parserConfidence = aiCorrection.parserConfidence || localCorrection.parserConfidence || '';
+  merged.parserReason = aiCorrection.parserReason || localCorrection.parserReason || '';
+  return merged;
+}
+
+function copyMealCorrectionFields(target, source, overwrite) {
+  ['calories', 'protein', 'carbs', 'fat'].forEach(function (key) {
+    if ((overwrite || target[key] === undefined) && hasSheetValue(source[key])) {
+      target[key] = source[key];
+    }
+  });
 }
 
 function parseMealCorrectionText(text) {
@@ -1265,6 +1333,10 @@ function parseMealCorrectionText(text) {
     correction.fat = fat;
   }
 
+  if (lockMacros.calories && correction.calories === undefined) {
+    correction.lockCalories = true;
+  }
+
   if (lockMacros.protein && correction.protein === undefined) {
     correction.lockProtein = true;
   }
@@ -1303,9 +1375,10 @@ function normalizeMealCorrectionCommandText(text) {
 
 function parseLockedMacroFields(text) {
   return {
-    protein: /(?:蛋白質|蛋白|protein|prot|p)\s*(?:不要動|不用動|不動|維持|照舊|保持|不要調|不用調)/i.test(text),
-    carbs: /(?:碳水|碳水化合物|carbs?|carbohydrates?|c)\s*(?:不要動|不用動|不動|維持|照舊|保持|不要調|不用調)/i.test(text),
-    fat: /(?:脂肪|油脂|fat|f)\s*(?:不要動|不用動|不動|維持|照舊|保持|不要調|不用調)/i.test(text)
+    calories: /(?:熱量|總熱量|calories?|kcal|卡|大卡)\s*(?:不要動|不用動|不動|維持|照舊|保持|不要調|不用調|不變|不用改|不要改|不重算|不用重算|不要重算|別重算)|(?:不要動|不用動|不動|維持|照舊|保持|不變|不用改|不要改|不重算|不用重算|不要重算|別重算)\s*(?:熱量|總熱量|calories?|kcal|卡|大卡)/i.test(text),
+    protein: /(?:蛋白質|蛋白|protein|prot|p)\s*(?:不要動|不用動|不動|維持|照舊|保持|不要調|不用調|不變|不用改|不要改)|(?:不要動|不用動|不動|維持|照舊|保持|不變|不用改|不要改)\s*(?:蛋白質|蛋白|protein|prot|p)/i.test(text),
+    carbs: /(?:碳水|碳水化合物|carbs?|carbohydrates?|c)\s*(?:不要動|不用動|不動|維持|照舊|保持|不要調|不用調|不變|不用改|不要改)|(?:不要動|不用動|不動|維持|照舊|保持|不變|不用改|不要改)\s*(?:碳水|碳水化合物|carbs?|carbohydrates?|c)/i.test(text),
+    fat: /(?:脂肪|油脂|fat|f)\s*(?:不要動|不用動|不動|維持|照舊|保持|不要調|不用調|不變|不用改|不要改)|(?:不要動|不用動|不動|維持|照舊|保持|不變|不用改|不要改)\s*(?:脂肪|油脂|fat|f)/i.test(text)
   };
 }
 
@@ -1347,7 +1420,9 @@ function validateMealCorrectionPreview(meal, nutrition, correction) {
     warnings.push('脂肪高於 120g，請確認。');
   }
 
-  if (macroEnergy > 0 && Math.abs(macroEnergy - calories) > Math.max(120, calories * 0.25)) {
+  if (!correction.lockCalories &&
+    macroEnergy > 0 &&
+    Math.abs(macroEnergy - calories) > Math.max(120, calories * 0.25)) {
     warnings.push('熱量與 P/C/F 換算值落差過大。');
   }
 

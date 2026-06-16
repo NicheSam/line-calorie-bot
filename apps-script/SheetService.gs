@@ -378,6 +378,7 @@ function deriveCorrectedNutrition(row, correction) {
   var hasProtein = hasSheetValue(correction.protein);
   var hasCarbs = hasSheetValue(correction.carbs);
   var hasFat = hasSheetValue(correction.fat);
+  var lockCalories = Boolean(correction.lockCalories) && !hasCalories;
   var protein = hasProtein ? Number(correction.protein) : before.protein;
   var carbs = hasCarbs ? Number(correction.carbs) : before.carbs;
   var fat = hasFat ? Number(correction.fat) : before.fat;
@@ -422,8 +423,13 @@ function deriveCorrectedNutrition(row, correction) {
       meta.push('指定熱量與部分營養素，其餘熱量差額優先由未指定的碳水與脂肪調整');
     }
   } else if (hasProtein || hasCarbs || hasFat) {
-    calories = macroCalories(protein, carbs, fat);
-    meta.push('指定營養素後，熱量依 4/4/9 公式重新計算');
+    if (lockCalories) {
+      calories = before.calories;
+      meta.push('指定營養素後，熱量依使用者要求維持原值，不用 4/4/9 重新計算');
+    } else {
+      calories = macroCalories(protein, carbs, fat);
+      meta.push('指定營養素後，熱量依 4/4/9 公式重新計算');
+    }
   } else {
     calories = before.calories;
   }

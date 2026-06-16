@@ -341,10 +341,10 @@ function callGeminiForMealCorrectionCommand(text, config) {
     '你是 LINE 飲食紀錄 Bot 的指令理解器。',
     '任務：把使用者自然語言修正指令轉成嚴格 JSON。只處理「修正上一筆餐點熱量或 P/C/F」的意圖。',
     '若不是餐點修正指令，intent 請填 unknown。',
-    '常見說法：這餐應該 700 左右、蛋白質大概 30、P 30、碳水抓 60、脂肪不要動、其他照熱量調整。',
-    '欄位說明：calories/protein/carbs/fat 為數字或 null；lock_protein/lock_carbs/lock_fat 表示使用者說不要動該營養素；adjust_remainder 表示其餘營養素配合熱量調整。',
+    '常見說法：這餐應該 700 左右、蛋白質大概 30、P 30、P改40熱量不動、碳水抓 60、脂肪不要動、其他照熱量調整。',
+    '欄位說明：calories/protein/carbs/fat 為數字或 null；lock_calories 表示使用者說熱量不動、總熱量維持或熱量不要重算；lock_protein/lock_carbs/lock_fat 表示使用者說不要動該營養素；adjust_remainder 表示其餘營養素配合熱量調整。',
     '只能輸出 JSON，不要輸出 Markdown。',
-    'JSON 格式：{"intent":"meal_correction|unknown","calories":null,"protein":null,"carbs":null,"fat":null,"lock_protein":false,"lock_carbs":false,"lock_fat":false,"adjust_remainder":false,"confidence":"low|medium|high","reason":"string"}',
+    'JSON 格式：{"intent":"meal_correction|unknown","calories":null,"protein":null,"carbs":null,"fat":null,"lock_calories":false,"lock_protein":false,"lock_carbs":false,"lock_fat":false,"adjust_remainder":false,"confidence":"low|medium|high","reason":"string"}',
     '',
     '使用者訊息：' + String(text || '')
   ].join('\n');
@@ -389,6 +389,7 @@ function normalizeMealCorrectionCommand(parsed) {
     correction.fat = toNumber(parsed.fat, 0);
   }
 
+  correction.lockCalories = Boolean(parsed.lock_calories);
   correction.lockProtein = Boolean(parsed.lock_protein);
   correction.lockCarbs = Boolean(parsed.lock_carbs);
   correction.lockFat = Boolean(parsed.lock_fat);
