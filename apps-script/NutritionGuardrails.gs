@@ -19,6 +19,7 @@ function analyzeMealContext(estimate) {
   var combined = [text, ruleText, riskText].join(' ');
   var hasReliableUnitFood = hasReliableUnitFoodEstimate(text, ruleText);
   var hasProteinMainDish = hasProteinMainDishText(combined);
+  var hasSmallPortion = hasSmallPortionContext(estimate, combined);
 
   return {
     text: text,
@@ -30,7 +31,8 @@ function analyzeMealContext(estimate) {
     hasStarch: /(飯|白飯|糙米|麵|義大利麵|麵包|吐司|馬鈴薯|地瓜|玉米|粥|米粉|冬粉)/.test(combined),
     hasVegetableOnlyCarb: /(花椰菜|青花菜|櫛瓜|高麗菜|青菜|菠菜|菇|菇類|生菜)/.test(text),
     hasReliableUnitFood: hasReliableUnitFood,
-    hasCarbDenseSnack: hasCarbDenseSnackText(combined)
+    hasCarbDenseSnack: hasCarbDenseSnackText(combined),
+    hasSmallPortion: hasSmallPortion
   };
 }
 
@@ -46,6 +48,11 @@ function ensureNutritionTotal(estimate) {
 }
 
 function applyProteinFloorGuardrail(estimate, context) {
+  if (context.hasSmallPortion) {
+    markNutritionDiagnostic(estimate, '略過蛋白質主菜下限：照片疑似少量/試吃/小份量。');
+    return;
+  }
+
   if (context.hasReliableUnitFood) {
     markNutritionDiagnostic(estimate, '略過蛋白質主菜下限：已辨識為單位明確食物。');
     return;
@@ -60,6 +67,11 @@ function applyProteinFloorGuardrail(estimate, context) {
 }
 
 function applyFatFloorGuardrail(estimate, context) {
+  if (context.hasSmallPortion) {
+    markNutritionDiagnostic(estimate, '略過脂肪下限：照片疑似少量/試吃/小份量。');
+    return;
+  }
+
   if (!context.hasFattyMeat || estimate.total.fat_g >= 8) {
     return;
   }
@@ -69,6 +81,11 @@ function applyFatFloorGuardrail(estimate, context) {
 }
 
 function applyCarbGuardrail(estimate, context) {
+  if (context.hasSmallPortion) {
+    markNutritionDiagnostic(estimate, '略過主食碳水下限：照片疑似少量/試吃/小份量。');
+    return;
+  }
+
   if (!context.hasStarch && !context.hasCarbDenseSnack && estimate.total.carbs_g > 40) {
     estimate.total.carbs_g = context.hasVegetableOnlyCarb ? 20 : 30;
     markNutritionGuardrail(estimate, '照片未見明顯主食，原碳水估算偏高，已下修。');
@@ -98,6 +115,11 @@ function applyMacroCalorieGuardrail(estimate) {
 }
 
 function applyMealCalorieFloorGuardrail(estimate, context) {
+  if (context.hasSmallPortion) {
+    markNutritionDiagnostic(estimate, '略過主餐熱量下限：照片疑似少量/試吃/小份量。');
+    return;
+  }
+
   if (context.hasReliableUnitFood) {
     markNutritionDiagnostic(estimate, '略過蛋白質主菜熱量下限：已辨識為單位明確食物。');
     return;
@@ -183,4 +205,31 @@ function getNutritionGuardrailText(estimate) {
       return [item.name, item.portion_description].join(' ');
     }).join(' ')
   ].join(' ');
+}
+
+function hasSmallPortionContext(estimate, text) {
+  var portion = String(estimate.portion_size_class || '').toLowerCase();
+  var context = String(estimate.serving_context || '').toLowerCase();
+  var weight = toNumber(estimate.estimated_visible_weight_g, 0) || estimateGuardrailTotalWeight(estimate);
+  var value = String(text || '');
+
+  if (portion === 'tiny' || portion === 'small') {
+    return true;
+  }
+
+  if (context === 'tasting' || context === 'snack') {
+    return true;
+  }
+
+  if (/(small_portion|試吃|少量|小份|小碗|小盒|小紙盤|一口|幾口|幾塊|切塊|半份|單顆|單個|剩下|局部|sample|tasting|small portion)/i.test(value)) {
+    return true;
+  }
+
+  return weight > 0 && weight <= 90 && (estimate.items || []).length <= 3;
+}
+
+function estimateGuardrailTotalWeight(estimate) {
+  return (estimate.items || []).reduce(function (sum, item) {
+    return sum + toNumber(item.estimated_weight_g, 0);
+  }, 0);
 }

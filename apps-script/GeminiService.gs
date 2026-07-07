@@ -5,6 +5,9 @@ function callGeminiForMealEstimate(imageBlob, config, foodRules) {
     '請根據單張餐點照片粗估熱量與三大營養素，回傳繁體中文 JSON。',
     '不要假裝精準；照片看不出份量、油量、醬料時，請提高 uncertainty_factors 並降低 confidence。',
     '所有數字使用合理估算值，單位為 kcal 或 g。',
+    '估算前必須先判斷份量情境：tiny=一口/單顆/極少量，small=試吃/小碗/小紙盤/少量切塊，normal=一般一人份，large=大份或多人份，unknown=看不出。',
+    '如果照片像試吃、餐會夾取、小碗少量、手持小紙盤、局部特寫、只剩幾塊肉或單顆點心，請優先標記 portion_size_class 為 tiny 或 small，serving_context 為 tasting 或 snack，並以可見可食重量估算，不要套完整主餐份量。',
+    '看到雞腿、炸雞、烤鴨、蛋糕、捲餅等高熱量食物時，仍必須先看可見份量；少量或切塊不得直接使用完整一份主餐、完整一支雞腿或完整套餐的熱量。',
     '請務必先拆成 items，再加總 total。常見基準：熟雞腿肉每 100g 約 200-230 kcal、蛋白質 24-27g、脂肪 10-14g；熟雞胸肉每 100g 約 160-180 kcal、蛋白質 30-33g、脂肪 3-5g；非澱粉蔬菜每 100g 約 20-50 kcal、碳水 4-10g。',
     '如果照片中有明顯雞肉、雞腿、豬肉、牛肉、魚、蛋、豆腐等蛋白質主菜，整餐蛋白質通常不應低於 15g，除非份量極少，且必須在 uncertainty_factors 說明。',
     '如果照片中沒有白飯、麵、麵包、馬鈴薯、地瓜、玉米等明顯澱粉主食，整餐碳水通常不應高於 35g，除非醬料或裹粉明顯。',
@@ -12,7 +15,7 @@ function callGeminiForMealEstimate(imageBlob, config, foodRules) {
     formatFoodRulesForPrompt(rules),
     '只能輸出 JSON，不要輸出 Markdown。',
     'JSON 必須使用以下英文欄位名稱：',
-    '{"meal_name":"string","items":[{"name":"string","portion_description":"string","estimated_weight_g":0,"calories_kcal":0,"protein_g":0,"carbs_g":0,"fat_g":0,"confidence":"low|medium|high"}],"total":{"calories_kcal":0,"protein_g":0,"carbs_g":0,"fat_g":0},"confidence":"low|medium|high","uncertainty_factors":["string"],"recommended_user_checks":["string"]}',
+    '{"meal_name":"string","portion_size_class":"tiny|small|normal|large|unknown","serving_context":"tasting|snack|meal|shared|unknown","estimated_visible_weight_g":0,"items":[{"name":"string","portion_description":"string","portion_size_class":"tiny|small|normal|large|unknown","estimated_weight_g":0,"calories_kcal":0,"protein_g":0,"carbs_g":0,"fat_g":0,"confidence":"low|medium|high"}],"total":{"calories_kcal":0,"protein_g":0,"carbs_g":0,"fat_g":0},"confidence":"low|medium|high","uncertainty_factors":["string"],"recommended_user_checks":["string"]}',
     'total 裡的 calories_kcal、protein_g、carbs_g、fat_g 不可省略；若只能粗估，也請填合理估算值，不要填 0。'
   ].join('\n');
   var response = callGeminiGenerateContent({
@@ -571,6 +574,9 @@ function normalizeMealEstimate(estimate) {
       carbs_g: roundNonNegative(carbs),
       fat_g: roundNonNegative(fat)
     },
+    portion_size_class: normalizePortionSizeClass(estimate.portion_size_class || estimate.portion_class),
+    serving_context: normalizeServingContext(estimate.serving_context || estimate.meal_context),
+    estimated_visible_weight_g: roundNonNegative(estimate.estimated_visible_weight_g || estimate.visible_weight_g || itemTotals.estimated_weight_g),
     confidence: normalizeConfidence(estimate.confidence),
     uncertainty_factors: Array.isArray(estimate.uncertainty_factors) ? estimate.uncertainty_factors.slice(0, 8) : [],
     recommended_user_checks: Array.isArray(estimate.recommended_user_checks) ? estimate.recommended_user_checks.slice(0, 6) : []
@@ -636,6 +642,7 @@ function normalizeMealItem(item) {
   return {
     name: truncateText(item.name || '未知品項', 80),
     portion_description: truncateText(item.portion_description || item.portion || '照片粗估', 120),
+    portion_size_class: normalizePortionSizeClass(item.portion_size_class || item.portion_class),
     estimated_weight_g: roundNonNegative(item.estimated_weight_g || item.weight_g),
     calories_kcal: roundNonNegative(item.calories_kcal || item.calories),
     protein_g: roundNonNegative(item.protein_g || item.protein),
@@ -651,13 +658,27 @@ function sumMealItems(items) {
     acc.protein_g += toNumber(item.protein_g, 0);
     acc.carbs_g += toNumber(item.carbs_g, 0);
     acc.fat_g += toNumber(item.fat_g, 0);
+    acc.estimated_weight_g += toNumber(item.estimated_weight_g, 0);
     return acc;
   }, {
     calories_kcal: 0,
     protein_g: 0,
     carbs_g: 0,
-    fat_g: 0
+    fat_g: 0,
+    estimated_weight_g: 0
   });
+}
+
+function normalizePortionSizeClass(value) {
+  return value === 'tiny' || value === 'small' || value === 'normal' || value === 'large' || value === 'unknown'
+    ? value
+    : 'unknown';
+}
+
+function normalizeServingContext(value) {
+  return value === 'tasting' || value === 'snack' || value === 'meal' || value === 'shared' || value === 'unknown'
+    ? value
+    : 'unknown';
 }
 
 function firstNumber(values, fallback) {
@@ -728,20 +749,26 @@ function applyFoodRulesToEstimate(estimate, rules) {
   var benchmark = buildFoodRuleBenchmark(primary.rule, primary.units);
   var range = buildFoodRuleRange(benchmark, riskTags);
   var beforeCalories = toNumber(estimate.total.calories_kcal, 0);
+  var smallPortion = isSmallPortionEstimate(estimate);
 
   estimate.rule_matches = matches.map(function (match) {
     return match.rule.food_keyword + ' x ' + match.units + ' ' + match.rule.portion_unit;
   });
   estimate.risk_tags = riskTags;
 
-  if (beforeCalories > 0 && beforeCalories < range.caloriesMin) {
+  if (smallPortion) {
+    estimate.risk_tags = uniqueStrings((estimate.risk_tags || []).concat(['small_portion']));
+    estimate.adjustment_reasons.push('FoodRules 略過自動上修：照片疑似少量/試吃/小份量，保留影像估算。');
+  } else if (beforeCalories > 0 && beforeCalories < range.caloriesMin) {
     raiseEstimateCaloriesWithFoodRulePolicy(estimate, range.caloriesMin, riskTags);
     estimate.adjustment_reasons.push(
       'FoodRules 下限上修：' + primary.rule.food_keyword + ' 參考下限 ' + range.caloriesMin + ' kcal'
     );
   }
 
-  applyFoodRuleMacroFloors(estimate, range);
+  if (!smallPortion) {
+    applyFoodRuleMacroFloors(estimate, range);
+  }
 
   if (beforeCalories > 0 && beforeCalories > range.caloriesMax * 1.25) {
     estimate.adjustment_reasons.push(
@@ -910,7 +937,13 @@ function parseFoodRuleRiskTags(rule) {
 }
 
 function inferRiskTagsFromEstimate(estimate) {
-  return inferRiskTagsFromText(getFoodRuleHaystack(estimate));
+  var tags = inferRiskTagsFromText(getFoodRuleHaystack(estimate));
+
+  if (isSmallPortionEstimate(estimate)) {
+    tags.push('small_portion');
+  }
+
+  return uniqueStrings(tags);
 }
 
 function inferFoodRuleRiskTags(rule) {
@@ -935,8 +968,30 @@ function inferRiskTagsFromText(text) {
   if (/(火鍋|鍋|涮涮鍋|麻辣鍋|鍋物|火鍋料)/.test(value)) tags.push('hotpot');
   if (/(甜點|蛋塔|塔|派|奶茶|珍珠|剉冰|豆花|車輪餅|雞蛋糕)/.test(value)) tags.push('dessert');
   if (/(拼盤|分享|多人|套餐)/.test(value)) tags.push('shared_portion');
+  if (/(試吃|少量|小份|小碗|小盒|小紙盤|一口|幾口|幾塊|切塊|半份|單顆|單個|剩下|局部|sample|tasting|small portion)/i.test(value)) tags.push('small_portion');
 
   return uniqueStrings(tags);
+}
+
+function isSmallPortionEstimate(estimate) {
+  var portion = String(estimate.portion_size_class || '').toLowerCase();
+  var context = String(estimate.serving_context || '').toLowerCase();
+  var weight = toNumber(estimate.estimated_visible_weight_g, 0) || estimateTotalWeight(estimate);
+  var text = getFoodRuleHaystack(estimate);
+
+  if (portion === 'tiny' || portion === 'small') {
+    return true;
+  }
+
+  if (context === 'tasting' || context === 'snack') {
+    return true;
+  }
+
+  if (/(試吃|少量|小份|小碗|小盒|小紙盤|一口|幾口|幾塊|切塊|半份|單顆|單個|剩下|局部|sample|tasting|small portion)/i.test(text)) {
+    return true;
+  }
+
+  return weight > 0 && weight <= 90 && (estimate.items || []).length <= 3;
 }
 
 function inferFoodRuleCategory(rule) {
